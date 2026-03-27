@@ -1,22 +1,24 @@
 """
-AutoCAD Engineering Drawing — Dimension Highlighter v3
+AutoCAD Engineering Drawing — Dimension Highlighter v4
 ======================================================
-Features:
-  • Multi-angle OCR (0°, 90° CW, 90° CCW) — catches vertical dimensions
-  • Radius (R / RAD) and Diameter (Ø / DIA / D) dimension detection
-  • Tolerance detection: +X.XXX/-Y.YYY each with [metric] counterpart
-  • ±X.XXX [±Y.YY] symmetric tolerance detection
-  • Image preprocessing: contrast + sharpen for fine text accuracy
-  • 400 DPI rendering
-  • Improved highlight positioning — tight per-token bboxes, padded cleanly
-  • Color logic (simple and consistent):
-      🟡 Yellow = dimension pair CORRECT (covers both inch + metric values)
-      🔴 Red = dimension pair WRONG (inch→metric conversion mismatch)
-      🟡 Yellow = tolerance pair CORRECT
-      🔴 Red = tolerance pair WRONG
+Key fix vs v3: each OCR angle is processed INDEPENDENTLY.
+Matches found at 0° use only 0° token bboxes → tight horizontal highlights.
+Matches found at 90° use only 90° token bboxes → tight vertical highlights.
+No cross-angle bbox unions → no giant red bands.
+
+Color logic:
+  🟡 Yellow = dimension checked and conversion is CORRECT
+  🔴 Red    = dimension checked and conversion is WRONG
+
+Detects:
+  • Linear pairs:         1.234 [31.34]
+  • Radius:               R1.250 [31.75]  |  RAD 1.250 [31.75]
+  • Diameter:             Ø1.250 [31.75]  |  DIA 1.250 [31.75]  |  ⌀
+  • Stacked tolerances:   +.005 [+.13]  (next line)  -.000 [-.00]
+  • Symmetric tolerances: ±0.005 [±0.13]  |  +/-0.005 [+/-0.13]
 
 Usage:
-  python3 highlight_dimensions_v3.py input.pdf output_highlighted.pdf
+  python3 highlight_dimensions_v4.py input.pdf output_highlighted.pdf
 """
 
 import sys, re
@@ -30,106 +32,51 @@ from pypdf.generic import (
 import pdfplumber
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DPI = 400
-TOLERANCE_PCT = 0.025 # 2.5% rounding tolerance (covers drawing rounding)
-ANGLES = [0, 90, 270]
-HIGHLIGHT_PAD = 2 # px padding around each highlight box
+DPI           = 400
+TOLERANCE_PCT = 0.025   # 2.5% — covers drawing rounding
+ANGLES        = [0, 90, 270]
+HIGHLIGHT_PAD = 1       # points padding around highlight
 
+# ── Pattern building blocks ───────────────────────────────────────────────────
+OB  = r'[\[({]'                        # opening bracket variant
+CB  = r'[\])}]'                        # closing bracket variant
+NUM = r'[+-]?\s*\d*\.?\d[\d,\s]*'     # signed number, allows OCR spaces
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PATTERNS
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Opening/closing bracket variants (OCR sometimes reads [ as ( or {)
-OB = r'[\[({]'
-CB = r'[\])}]'
-
-# Signed number (handles: 1.5 | .005 | +.005 | -0.12 | 1,234)
-NUM = r'[+-]?\s*\d*\.?\d[\d,]*'
-
-# ── 1. Standard linear pair: 1.234 [31.34] ───────────────────────────────────
+# ── Compiled patterns ─────────────────────────────────────────────────────────
 LINEAR_RE = re.compile(
-    rf'({NUM})' # group1: inch value
-    rf'\s*{OB}\s*'
-    rf'({NUM})' # group2: metric value
-    rf'\s*{CB}',
-    re.IGNORECASE
-)
+    rf'({NUM})\s*{OB}\s*({NUM})\s*{CB}', re.I)
 
-# ── 2. Radius: R1.250 [31.75] or RAD 1.250 [31.75] ──────────────────────────
 RADIUS_RE = re.compile(
-    rf'(?:R|RAD\.?)\s*({NUM})' # group1: inch radius value
-    rf'\s*{OB}\s*'
-    rf'({NUM})' # group2: metric radius value
-    rf'\s*{CB}',
-    re.IGNORECASE
-)
+    rf'(?:R|RAD\.?)\s*({NUM})\s*{OB}\s*({NUM})\s*{CB}', re.I)
 
-# ── 3. Diameter: Ø1.250 [31.75] or DIA 1.250 [31.75] or ⌀1.250 [31.75] ─────
 DIA_RE = re.compile(
-    rf'(?:[ØO⌀]|DIA\.?|DIAM\.?)\s*({NUM})' # group1: inch diameter value
-    rf'\s*{OB}\s*'
-    rf'({NUM})' # group2: metric diameter value
-    rf'\s*{CB}',
-    re.IGNORECASE
-)
+    rf'(?:[ØO⌀]|DIA\.?|DIAM\.?)\s*({NUM})\s*{OB}\s*({NUM})\s*{CB}', re.I)
 
-# ── 4. Stacked tolerance pair: +.005 [+.13] followed by -.000 [-.00] ─────────
-# Matches two consecutive signed dimension+bracket pairs on adjacent lines
 TOL_STACK_RE = re.compile(
-    rf'([+]\s*{NUM})' # group1: positive inch tol
-    rf'\s*{OB}\s*'
-    rf'([+]?\s*{NUM})' # group2: positive metric tol
-    rf'\s*{CB}'
+    rf'([+]\s*\d*\.?\d[\d,]*)\s*{OB}\s*([+]?\s*\d*\.?\d[\d,]*)\s*{CB}'
     rf'\s*'
-    rf'([-]\s*{NUM})' # group3: negative inch tol
-    rf'\s*{OB}\s*'
-    rf'([-]?\s*{NUM})' # group4: negative metric tol
-    rf'\s*{CB}',
-    re.IGNORECASE
-)
+    rf'([-]\s*\d*\.?\d[\d,]*)\s*{OB}\s*([+\-]?\s*\d*\.?\d[\d,]*)\s*{CB}', re.I)
 
-# ── 5. Symmetric tolerance: ±0.005 [±0.13] or +/-0.005 [+/-0.13] ────────────
 TOL_SYM_RE = re.compile(
-    rf'(?:[±]|[+][/-])\s*({NUM})' # group1: inch symmetric tol
-    rf'\s*{OB}\s*'
-    rf'(?:[±]|[+][/-])?\s*({NUM})' # group2: metric symmetric tol
-    rf'\s*{CB}',
-    re.IGNORECASE
-)
-
-# ── 6. Explicit inch marker without metric: 2.5" | 1/4 in ───────────────────
-INCH_ONLY_RE = re.compile(
-    r'(\d+(?:\.\d+)?|\d+/\d+)\s*(?:"|in(?:ch(?:es)?)?)\b',
-    re.IGNORECASE
-)
+    rf'(?:[±]|[+][/\-])\s*(\d*\.?\d[\d,]*)\s*{OB}\s*(?:[±]|[+][/\-])?\s*(\d*\.?\d[\d,]*)\s*{CB}', re.I)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_num(s):
-    """Strip spaces OCR inserted inside a number, strip sign chars, then parse."""
     return float(re.sub(r'[\s,]', '', s))
 
 def clean_abs(s):
-    return abs(clean_num(re.sub(r'[^0-9.,]', '', s)))
+    return abs(clean_num(re.sub(r'[^0-9.,\s]', '', s)))
 
 def verify(inch_val, metric_val):
-    """Return True if metric_val is within TOLERANCE_PCT of inch_val * 25.4."""
     if abs(inch_val) < 1e-9:
         return abs(metric_val) < 0.1
     expected = abs(inch_val) * 25.4
     return abs(expected - abs(metric_val)) / expected <= TOLERANCE_PCT
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# IMAGE PREPROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Image preprocessing ───────────────────────────────────────────────────────
 def preprocess(img):
-    """Boost contrast and sharpen for cleaner OCR on engineering drawings."""
     img = img.convert("L")
     img = ImageEnhance.Contrast(img).enhance(2.2)
     img = ImageEnhance.Sharpness(img).enhance(2.5)
@@ -137,87 +84,74 @@ def preprocess(img):
     return img.convert("RGB")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COORDINATE TRANSFORMS (rotated-image pixel → original-image pixel)
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Coordinate unrotation ─────────────────────────────────────────────────────
 def unrotate_bbox(rx0, ry0, rx1, ry1, angle, orig_W, orig_H):
     """
-    Map a bounding box found in a rotated image back to the original image space.
-    angle: degrees CCW that the original was rotated to produce the OCR image.
+    Map a bbox from a rotated image back to original image pixel space.
+    angle: degrees CCW the original was rotated to produce the OCR image.
     """
     if angle == 0:
         return rx0, ry0, rx1, ry1
 
     elif angle == 90:
-        # Rotated 90° CCW: rotated(rx, ry) → original(ry, orig_W - rx)
-        # rotated image size = (orig_H, orig_W)
-        ox0 = ry0
-        oy0 = orig_W - rx1
-        ox1 = ry1
-        oy1 = orig_W - rx0
-        return max(0, ox0), max(0, oy0), min(orig_W, ox1), min(orig_H, oy1)
-
-    elif angle == 270:
-        # Rotated 90° CW: rotated(rx, ry) → original(orig_H - ry, rx)
-        # rotated image size = (orig_H, orig_W)
-        ox0 = orig_H - ry1
+        # rotate(90) in PIL = 90° CCW
+        # rotated image shape: W_rot = orig_H, H_rot = orig_W
+        # forward:  (ox, oy) → (oy,  orig_W - ox)    [rotated coords]
+        # inverse:  (rx, ry) → (orig_W - ry, rx)
+        ox0 = orig_W - ry1
         oy0 = rx0
-        ox1 = orig_H - ry0
+        ox1 = orig_W - ry0
         oy1 = rx1
         return max(0, ox0), max(0, oy0), min(orig_W, ox1), min(orig_H, oy1)
 
-    return rx0, ry0, rx1, ry1 # fallback
+    elif angle == 270:
+        # rotate(270) in PIL = 90° CW
+        # rotated image shape: W_rot = orig_H, H_rot = orig_W
+        # forward:  (ox, oy) → (orig_H - oy, ox)    [rotated coords]
+        # inverse:  (rx, ry) → (ry, orig_H - rx)
+        ox0 = ry0
+        oy0 = orig_H - rx1
+        ox1 = ry1
+        oy1 = orig_H - rx0
+        return max(0, ox0), max(0, oy0), min(orig_W, ox1), min(orig_H, oy1)
+
+    return rx0, ry0, rx1, ry1
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PDF ANNOTATION
-# ══════════════════════════════════════════════════════════════════════════════
+# ── PDF annotation ────────────────────────────────────────────────────────────
+YELLOW = (1.0, 0.90, 0.0)
+RED    = (1.0, 0.10, 0.10)
 
 def make_highlight(x0, y0, x1, y1, color):
-    """Create a PDF highlight annotation at the given PDF-space coordinates."""
     p = HIGHLIGHT_PAD
     x0 -= p; y0 -= p; x1 += p; y1 += p
     return DictionaryObject({
-        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Type"):    NameObject("/Annot"),
         NameObject("/Subtype"): NameObject("/Highlight"),
-        NameObject("/Rect"): ArrayObject([FloatObject(v) for v in [x0, y0, x1, y1]]),
+        NameObject("/Rect"):    ArrayObject([FloatObject(v) for v in [x0, y0, x1, y1]]),
         NameObject("/QuadPoints"): ArrayObject([
             FloatObject(x0), FloatObject(y1),
             FloatObject(x1), FloatObject(y1),
             FloatObject(x0), FloatObject(y0),
             FloatObject(x1), FloatObject(y0),
         ]),
-        NameObject("/C"): ArrayObject([FloatObject(c) for c in color]),
-        NameObject("/CA"): FloatObject(0.6),
-        NameObject("/F"): NumberObject(4),
+        NameObject("/C"):  ArrayObject([FloatObject(c) for c in color]),
+        NameObject("/CA"): FloatObject(0.55),
+        NameObject("/F"):  NumberObject(4),
     })
 
-YELLOW = (1.0, 0.90, 0.0) # correct
-RED = (1.0, 0.10, 0.10) # mismatch
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOKEN EXTRACTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_tokens_at_angle(base_img, angle, orig_W, orig_H):
+# ── Per-angle OCR + stream builder ───────────────────────────────────────────
+def run_ocr_angle(base_img, angle, orig_W, orig_H):
     """
-    Rotate base_img by `angle` degrees CCW, run OCR, then unrotate all bboxes
-    back into original image pixel space. Returns list of token dicts.
+    Rotate base_img, run OCR, unrotate all bboxes back to original pixel space.
+    Returns list of token dicts with 'text', 'x0','y0','x1','y1', 'conf'.
     """
-    if angle == 0:
-        rot = base_img
-    else:
-        rot = base_img.rotate(angle, expand=True)
-
+    rot = base_img.rotate(angle, expand=True) if angle != 0 else base_img
     proc = preprocess(rot)
-
-    # psm 11 = sparse text (any orientation), oem 3 = best LSTM engine
     cfg = "--oem 3 --psm 11"
     ocr = pytesseract.image_to_data(proc, config=cfg,
                                      output_type=pytesseract.Output.DICT)
-
     tokens = []
     for i in range(len(ocr['text'])):
         txt = ocr['text'][i].strip()
@@ -227,7 +161,7 @@ def extract_tokens_at_angle(base_img, angle, orig_W, orig_H):
             conf = float(ocr['conf'][i])
         except (ValueError, TypeError):
             conf = 0
-        if conf < 15: # drop very low-confidence noise
+        if conf < 15:
             continue
 
         rx0 = ocr['left'][i]
@@ -242,33 +176,29 @@ def extract_tokens_at_angle(base_img, angle, orig_W, orig_H):
             'x0': bx0, 'y0': by0,
             'x1': bx1, 'y1': by1,
             'conf': conf,
-            'angle': angle,
         })
-
     return tokens
 
 
 def build_stream(tokens):
-    """
-    Concatenate all token texts into one searchable string.
-    Returns (stream, char_to_token_index mapping).
-    """
+    """Return (stream_str, char→token_index dict)."""
     stream = ""
     c2t = {}
     for ti, tok in enumerate(tokens):
-        start = len(stream)
+        s = len(stream)
         for ci in range(len(tok['text'])):
-            c2t[start + ci] = ti
+            c2t[s + ci] = ti
         stream += tok['text']
-        c2t[len(stream)] = ti # also map the space
+        c2t[len(stream)] = ti
         stream += " "
     return stream, c2t
 
 
 def bbox_for_span(s, e, tokens, c2t):
     """
-    Return the union bounding box of all tokens whose characters overlap
-    the char range [s, e) in the stream. Returns None if no tokens found.
+    Tight union bbox of tokens whose chars overlap [s, e).
+    Returns None if no tokens found.
+    Rejects absurdly large spans (likely cross-line OCR merge artefacts).
     """
     tis = set()
     for ci in range(s, min(e, len(c2t))):
@@ -276,42 +206,168 @@ def bbox_for_span(s, e, tokens, c2t):
             tis.add(c2t[ci])
     if not tis:
         return None
-    return (
-        min(tokens[i]['x0'] for i in tis),
-        min(tokens[i]['y0'] for i in tis),
-        max(tokens[i]['x1'] for i in tis),
-        max(tokens[i]['y1'] for i in tis),
-    )
+
+    x0 = min(tokens[i]['x0'] for i in tis)
+    y0 = min(tokens[i]['y0'] for i in tis)
+    x1 = max(tokens[i]['x1'] for i in tis)
+    y1 = max(tokens[i]['y1'] for i in tis)
+
+    # Reject if the resulting box is suspiciously tall or wide
+    # (indicates cross-line token merge; height cap = 3 × median token height)
+    heights = [tokens[i]['y1'] - tokens[i]['y0'] for i in tis]
+    med_h = sorted(heights)[len(heights) // 2]
+    if (y1 - y0) > max(med_h * 4, 60):   # allow up to 4 token-heights
+        return None
+
+    return x0, y0, x1, y1
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN PROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Per-angle dimension finder ────────────────────────────────────────────────
+Match = dict   # {inch_val, metric_val, ok, bb_orig_px, kind, label}
 
+def find_matches_in_stream(stream, c2t, tokens, angle_label):
+    """
+    Run all patterns against the token stream for one OCR angle.
+    Returns list of Match dicts.
+    """
+    matches = []
+    used_spans = []
+
+    def overlaps(s, e):
+        for us, ue in used_spans:
+            if s < ue and e > us:
+                return True
+        return False
+
+    def record(pattern, stream, kind, parse_fn):
+        for m in pattern.finditer(stream):
+            if overlaps(m.start(), m.end()):
+                continue
+            result = parse_fn(m)
+            if result is None:
+                continue
+            inch_val, metric_val, full_span = result
+            if abs(inch_val) < 1e-9:
+                continue
+            bb = bbox_for_span(full_span[0], full_span[1], tokens, c2t)
+            if bb is None:
+                continue
+            ok = verify(inch_val, metric_val)
+            used_spans.append((m.start(), m.end()))
+            matches.append({
+                'inch_val':   inch_val,
+                'metric_val': metric_val,
+                'ok':         ok,
+                'bb':         bb,
+                'kind':       kind,
+                'angle':      angle_label,
+            })
+
+    # Radius
+    def parse_radius(m):
+        try:
+            return clean_abs(m.group(1)), clean_abs(m.group(2)), (m.start(), m.end())
+        except (ValueError, AttributeError):
+            return None
+    record(RADIUS_RE, stream, "RADIUS", parse_radius)
+
+    # Diameter
+    def parse_dia(m):
+        try:
+            return clean_abs(m.group(1)), clean_abs(m.group(2)), (m.start(), m.end())
+        except (ValueError, AttributeError):
+            return None
+    record(DIA_RE, stream, "DIAMETER", parse_dia)
+
+    # Symmetric tolerance
+    def parse_tol_sym(m):
+        try:
+            return clean_abs(m.group(1)), clean_abs(m.group(2)), (m.start(), m.end())
+        except (ValueError, AttributeError):
+            return None
+    record(TOL_SYM_RE, stream, "TOL±", parse_tol_sym)
+
+    # Stacked tolerance — two pairs; highlight full span
+    for m in TOL_STACK_RE.finditer(stream):
+        if overlaps(m.start(), m.end()):
+            continue
+        try:
+            pos_i = clean_abs(m.group(1)); pos_m = clean_abs(m.group(2))
+            neg_i = clean_abs(m.group(3)); neg_m = clean_abs(m.group(4))
+        except (ValueError, AttributeError):
+            continue
+        bb = bbox_for_span(m.start(), m.end(), tokens, c2t)
+        if bb is None:
+            continue
+        ok = verify(pos_i, pos_m) and verify(neg_i, neg_m)
+        used_spans.append((m.start(), m.end()))
+        matches.append({
+            'inch_val':   pos_i,
+            'metric_val': pos_m,
+            'ok':         ok,
+            'bb':         bb,
+            'kind':       "TOL+/-",
+            'angle':      angle_label,
+        })
+
+    # Linear (catch-all last)
+    def parse_linear(m):
+        try:
+            return clean_num(m.group(1)), clean_num(m.group(2)), (m.start(), m.end())
+        except (ValueError, AttributeError):
+            return None
+    record(LINEAR_RE, stream, "LINEAR", parse_linear)
+
+    return matches
+
+
+# ── Deduplicate matches across angles ─────────────────────────────────────────
+def deduplicate(all_matches, orig_W, orig_H):
+    """
+    If two matches from different angles have nearly identical inch values
+    and overlapping bboxes, keep the one whose bbox aspect ratio best fits
+    its angle (horizontal for 0°, vertical for 90°/270°).
+    """
+    kept = []
+    for m in all_matches:
+        duplicate = False
+        bx0, by0, bx1, by1 = m['bb']
+        for k in kept:
+            kx0, ky0, kx1, ky1 = k['bb']
+            # Check value similarity
+            if abs(m['inch_val'] - k['inch_val']) > 0.01:
+                continue
+            # Check bbox overlap
+            overlap_x = max(0, min(bx1, kx1) - max(bx0, kx0))
+            overlap_y = max(0, min(by1, ky1) - max(by0, ky0))
+            if overlap_x > 0 and overlap_y > 0:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(m)
+    return kept
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def process(input_path, output_path):
-    print(f"\n📄 {input_path}")
-    print(f" DPI={DPI} Angles={ANGLES} Tolerance={TOLERANCE_PCT*100:.1f}%\n")
+    print(f"\n📄  {input_path}")
+    print(f"    DPI={DPI}  Angles={ANGLES}  Tolerance={TOLERANCE_PCT*100:.1f}%\n")
 
-    # Get PDF page dimensions in points (1 point = 1/72 inch)
     with pdfplumber.open(input_path) as pdf:
         pdf_dims = [(p.width, p.height) for p in pdf.pages]
 
     images = convert_from_path(input_path, dpi=DPI)
-    print(f" Pages: {len(images)}\n")
+    print(f"    Pages: {len(images)}\n")
 
     all_page_annots = []
-    stats = {'correct': 0, 'mismatch': 0, 'tol_correct': 0, 'tol_mismatch': 0,
-             'radius': 0, 'diameter': 0}
+    stats = {'correct': 0, 'mismatch': 0}
 
     for page_idx, (base_img, (pdf_w, pdf_h)) in enumerate(zip(images, pdf_dims)):
         orig_W, orig_H = base_img.size
-
-        # Scale: image pixels → PDF points
         sx = pdf_w / orig_W
         sy = pdf_h / orig_H
 
         def img_to_pdf(ix0, iy0, ix1, iy1):
-            """Convert image-pixel bbox to PDF-point bbox (Y flipped)."""
             return (
                 ix0 * sx,
                 pdf_h - iy1 * sy,
@@ -319,189 +375,46 @@ def process(input_path, output_path):
                 pdf_h - iy0 * sy,
             )
 
-        # ── Collect and deduplicate tokens from all angles ────────────────────
-        raw_tokens = []
+        # ── Run OCR and find matches for each angle INDEPENDENTLY ─────────────
+        all_matches = []
+
         for angle in ANGLES:
-            toks = extract_tokens_at_angle(base_img, angle, orig_W, orig_H)
-            raw_tokens.extend(toks)
-            print(f" Page {page_idx+1} | {angle:3d}° → {len(toks):4d} tokens")
+            tokens = run_ocr_angle(base_img, angle, orig_W, orig_H)
+            # Sort tokens in reading order for this angle
+            if angle == 0:
+                tokens.sort(key=lambda t: (round(t['y0'] / 8) * 8, t['x0']))
+            elif angle == 90:
+                # After unrotation, vertical text: sort by x then y
+                tokens.sort(key=lambda t: (round(t['x0'] / 8) * 8, t['y0']))
+            else:
+                tokens.sort(key=lambda t: (round(t['x1'] / 8) * 8, -t['y0']))
 
-        # Deduplicate: same text within 8px of each other → keep highest conf
-        seen = {}
-        for t in raw_tokens:
-            key = (t['text'].lower(),
-                   round(t['x0'] / 8) * 8,
-                   round(t['y0'] / 8) * 8)
-            if key not in seen or t['conf'] > seen[key]['conf']:
-                seen[key] = t
-        tokens = list(seen.values())
-        # Sort by reading order (top→bottom, left→right) for stream coherence
-        tokens.sort(key=lambda t: (round(t['y0'] / 10) * 10, t['x0']))
+            stream, c2t = build_stream(tokens)
+            matches = find_matches_in_stream(stream, c2t, tokens, angle)
+            all_matches.extend(matches)
+            print(f"    Page {page_idx+1} | {angle:3d}° → {len(tokens):4d} tokens, "
+                  f"{len(matches)} dimensions found")
 
-        print(f" Page {page_idx+1} | unique tokens after dedup: {len(tokens)}\n")
-
-        stream, c2t = build_stream(tokens)
+        # ── Deduplicate across angles ─────────────────────────────────────────
+        unique_matches = deduplicate(all_matches, orig_W, orig_H)
+        print(f"    Page {page_idx+1} | unique dimensions after dedup: {len(unique_matches)}\n")
 
         page_annots = []
-        matched_spans = [] # list of (start, end) to avoid double-matching
+        for m in unique_matches:
+            color = YELLOW if m['ok'] else RED
+            bb_pdf = img_to_pdf(*m['bb'])
+            page_annots.append((*bb_pdf, color))
 
-        def overlaps_matched(s, e):
-            for ms, me in matched_spans:
-                if s < me and e > ms:
-                    return True
-            return False
-
-        def register(annots_list, bb, color):
-            """Convert img bbox → PDF bbox and append to annots list."""
-            if bb:
-                page_annots.append((*img_to_pdf(*bb), color))
-
-        def log_result(label, inch_val, metric_val, ok, kind=""):
-            exp = abs(inch_val) * 25.4
-            sym = "✅" if ok else "❌ MISMATCH"
-            tag = f" [{kind}]" if kind else ""
-            print(f" p{page_idx+1} {sym}{tag} | "
-                  f"{inch_val}\" → {exp:.3f} mm | stated [{metric_val:.3f}] mm")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 1. RADIUS dimensions
-        # ══════════════════════════════════════════════════════════════════════
-        for m in RADIUS_RE.finditer(stream):
-            if overlaps_matched(m.start(), m.end()):
-                continue
-            try:
-                inch_val = clean_abs(m.group(1))
-                metric_val = clean_abs(m.group(2))
-            except (ValueError, AttributeError):
-                continue
-            if inch_val == 0:
-                continue
-
-            ok = verify(inch_val, metric_val)
-            color = YELLOW if ok else RED
-            matched_spans.append((m.start(), m.end()))
-
-            bb = bbox_for_span(m.start(), m.end(), tokens, c2t)
-            register(page_annots, bb, color)
-
-            log_result("R", inch_val, metric_val, ok, "RADIUS")
-            stats['radius'] += 1
-            if ok: stats['correct'] += 1
-            else: stats['mismatch'] += 1
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 2. DIAMETER dimensions
-        # ══════════════════════════════════════════════════════════════════════
-        for m in DIA_RE.finditer(stream):
-            if overlaps_matched(m.start(), m.end()):
-                continue
-            try:
-                inch_val = clean_abs(m.group(1))
-                metric_val = clean_abs(m.group(2))
-            except (ValueError, AttributeError):
-                continue
-            if inch_val == 0:
-                continue
-
-            ok = verify(inch_val, metric_val)
-            color = YELLOW if ok else RED
-            matched_spans.append((m.start(), m.end()))
-
-            bb = bbox_for_span(m.start(), m.end(), tokens, c2t)
-            register(page_annots, bb, color)
-
-            log_result("Ø", inch_val, metric_val, ok, "DIAMETER")
-            stats['diameter'] += 1
-            if ok: stats['correct'] += 1
-            else: stats['mismatch'] += 1
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 3. STACKED TOLERANCES: +X [+Y] / -X [-Y]
-        # ══════════════════════════════════════════════════════════════════════
-        for m in TOL_STACK_RE.finditer(stream):
-            if overlaps_matched(m.start(), m.end()):
-                continue
-            try:
-                pos_inch = clean_abs(m.group(1))
-                pos_met = clean_abs(m.group(2))
-                neg_inch = clean_abs(m.group(3))
-                neg_met = clean_abs(m.group(4))
-            except (ValueError, AttributeError):
-                continue
-
-            ok_pos = verify(pos_inch, pos_met)
-            ok_neg = verify(neg_inch, neg_met)
-            ok = ok_pos and ok_neg
-            color = YELLOW if ok else RED
-            matched_spans.append((m.start(), m.end()))
-
-            bb = bbox_for_span(m.start(), m.end(), tokens, c2t)
-            register(page_annots, bb, color)
-
-            sym = "✅" if ok else "❌ MISMATCH"
-            print(f" p{page_idx+1} {sym} [TOL STACK] | "
-                  f"+{pos_inch}/−{neg_inch}\" → [{pos_met}/{neg_met}] mm")
-            if ok: stats['tol_correct'] += 1
-            else: stats['tol_mismatch'] += 1
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 4. SYMMETRIC TOLERANCES: ±X.XXX [±Y.YY]
-        # ══════════════════════════════════════════════════════════════════════
-        for m in TOL_SYM_RE.finditer(stream):
-            if overlaps_matched(m.start(), m.end()):
-                continue
-            try:
-                inch_val = clean_abs(m.group(1))
-                metric_val = clean_abs(m.group(2))
-            except (ValueError, AttributeError):
-                continue
-            if inch_val == 0:
-                continue
-
-            ok = verify(inch_val, metric_val)
-            color = YELLOW if ok else RED
-            matched_spans.append((m.start(), m.end()))
-
-            bb = bbox_for_span(m.start(), m.end(), tokens, c2t)
-            register(page_annots, bb, color)
-
-            sym = "✅" if ok else "❌ MISMATCH"
-            print(f" p{page_idx+1} {sym} [TOL ±] | ±{inch_val}\" → [±{metric_val}] mm")
-            if ok: stats['tol_correct'] += 1
-            else: stats['tol_mismatch'] += 1
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 5. STANDARD LINEAR DIMENSIONS
-        # ══════════════════════════════════════════════════════════════════════
-        for m in LINEAR_RE.finditer(stream):
-            if overlaps_matched(m.start(), m.end()):
-                continue
-            try:
-                inch_val = clean_num(m.group(1))
-                metric_val = clean_num(m.group(2))
-            except (ValueError, AttributeError):
-                continue
-            if abs(inch_val) < 1e-9:
-                continue
-
-            ok = verify(inch_val, metric_val)
-            color = YELLOW if ok else RED
-            matched_spans.append((m.start(), m.end()))
-
-            # Highlight the FULL match (inch value + brackets + metric value)
-            # as one unified highlight so it's clear what was checked
-            bb_full = bbox_for_span(m.start(), m.end(), tokens, c2t)
-            register(page_annots, bb_full, color)
-
-            log_result("", inch_val, metric_val, ok)
-            if ok: stats['correct'] += 1
-            else: stats['mismatch'] += 1
+            exp = abs(m['inch_val']) * 25.4
+            sym = "✅" if m['ok'] else "❌"
+            print(f"    p{page_idx+1} {sym} [{m['kind']:8s}] @{m['angle']:3d}° | "
+                  f"{m['inch_val']:.4f}\" → {exp:.3f} mm | stated [{m['metric_val']:.3f}] mm")
+            if m['ok']: stats['correct'] += 1
+            else:       stats['mismatch'] += 1
 
         all_page_annots.append(page_annots)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # WRITE ANNOTATED PDF
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Write annotated PDF ───────────────────────────────────────────────────
     reader = PdfReader(input_path)
     writer = PdfWriter()
     for page in reader.pages:
@@ -521,35 +434,23 @@ def process(input_path, output_path):
     with open(output_path, "wb") as f:
         writer.write(f)
 
-    total_dims = stats['correct'] + stats['mismatch']
-    total_tols = stats['tol_correct'] + stats['tol_mismatch']
-
     print(f"""
 ╔══════════════════════════════════════════╗
-║ SCAN COMPLETE v3                         ║
+║        SCAN COMPLETE  v4                 ║
 ╠══════════════════════════════════════════╣
-║ LINEAR DIMENSIONS                        ║
-║ ✅ Correct : {stats['correct']:<20}      ║
-║ ❌ Mismatches : {stats['mismatch']:<20}  ║
-║ 📐 Radius found : {stats['radius']:<20}   ║
-║ ⭕ Diameter found: {stats['diameter']:<20}║
-╠══════════════════════════════════════════  ╣
-║ TOLERANCES ║
-║ ✅ Correct : {stats['tol_correct']:<20}║
-║ ❌ Mismatches : {stats['tol_mismatch']:<20}║
+║  ✅ Correct conversions : {stats['correct']:<16}║
+║  ❌ Mismatches          : {stats['mismatch']:<16}║
+║  📌 Total highlights    : {total_highlights:<16}║
 ╠══════════════════════════════════════════╣
-║ 📌 Total highlights: {total_highlights:<20}║
-╠══════════════════════════════════════════╣
-║ 🟡 Yellow = Conversion OK ║
-║ 🔴 Red = Conversion WRONG ║
+║  🟡 Yellow = Conversion OK               ║
+║  🔴 Red    = Conversion WRONG            ║
 ╚══════════════════════════════════════════╝
 Output → {output_path}
 """)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python3 highlight_dimensions_v3.py input.pdf output.pdf")
+        print("Usage: python3 highlight_dimensions_v4.py input.pdf output.pdf")
         sys.exit(1)
     process(sys.argv[1], sys.argv[2])
