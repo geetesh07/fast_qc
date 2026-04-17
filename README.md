@@ -24,18 +24,39 @@ dim_qc.lsp
 
 ---
 
-## Supported dimension text formats
+## Supported conversion types
 
-| Format | Example |
-|--------|---------|
-| Linear | `1.234 [31.34]` |
-| Diameter | `Ø1.234 [31.34]` |
-| Radius | `R0.500 [12.70]` |
-| Symmetric tolerance | `1.234±0.005 [31.34±0.127]` |
-| Tolerance only | `±0.005 [±0.127]` |
-| Stacked bilateral | `+0.005 [+0.127] …` |
+The unit type is **auto-detected from the label** in the dimension text. No configuration needed — just label your dimensions correctly and run `DIMQC`.
 
-The metric value must be inside **square brackets** `[mm]`. This is the standard dual-unit annotation used in engineering drawings.
+| Conversion | Primary label examples | Alt label examples | Factor |
+|---|---|---|---|
+| Linear (inch → mm) | `""` `IN` `INCH` | `""` `MM` | × 25.4 |
+| Torque (in-lb → N-m) | `IN-LB` `LB-IN` `LBF-IN` | `N-M` `NM` | × 0.112985 |
+| Torque (N-mm → N-m) | `N-MM` `NMM` | `N-M` `NM` | × 0.001 |
+| Pressure (PSI → kPa) | `PSI` `LB/IN2` `LBF/IN2` | `KPA` `KN/M2` | × 6.89476 |
+| MOI (lb-in² → kg-m²) | `LB-IN2` `LB-IN^2` | `KG-M2` `KG-M^2` | × 2.9264×10⁻⁴ |
+| Imbalance (g-in → g-mm) | `G-IN` `G.IN` | `G-MM` `G.MM` | × 25.4 |
+
+## Dimension text format
+
+All types use the same bracket convention — the converted value goes in `[square brackets]`:
+
+```
+primary_value UNIT [alt_value UNIT]
+```
+
+| Example | Type |
+|---------|------|
+| `1.234 [31.34]` | Linear — no labels needed |
+| `Ø0.750 [19.05]` | Diameter |
+| `R0.500 [12.70]` | Radius |
+| `1.234±0.005 [31.34±0.127]` | With symmetric tolerance |
+| `12.5 IN-LB [1.412 N-M]` | Torque |
+| `1500 PSI [10342.1 KPA]` | Pressure |
+| `0.025 LB-IN2 [7.29E-6 KG-M2]` | Moment of inertia |
+| `5.0 G-IN [127.0 G-MM]` | Imbalance |
+
+> **No label on linear dimensions?** That's fine — `1.234 [31.34]` with no unit text is assumed to be inch → mm automatically.
 
 ---
 
