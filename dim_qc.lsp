@@ -116,6 +116,42 @@
 ;;; Safe string: replace nil with ""
 (defun DQC:s (x) (if (and x (= (type x) 'STR)) x ""))
 
+;;; Count decimal places in a raw number string, PRESERVING trailing zeros.
+;;; e.g. "0.2440" -> 4,  "R.005" -> 3,  "3.0" -> 1,  "25" -> 0
+;;; Stops counting at a tolerance separator (+, -, /, space after digit).
+(defun DQC:count-dp (s / i dot count c prev-digit)
+  (setq s (DQC:strip-pfx (DQC:trim s)))
+  (setq i 1 dot 0 count 0 prev-digit nil)
+  (while (<= i (strlen s))
+    (setq c (substr s i 1))
+    (cond
+      ((= c ".")
+       (setq dot i i (1+ i)))
+      ((wcmatch c "#")
+       (if (> dot 0) (setq count (1+ count)))
+       (setq prev-digit T i (1+ i)))
+      ((and prev-digit (or (= c "+") (= c "-") (= c "/") (= c " ")))
+       (setq i (1+ (strlen s))))  ; stop at tolerance suffix
+      (T (setq i (1+ i)))))
+  (max 1 count))
+
+;;; Extract the inch text segment (text before the first '[') from a stripped string.
+(defun DQC:inch-seg (s / pos)
+  (setq pos (DQC:find-char s "[" 1))
+  (if (= pos 0) s
+    (DQC:trim (substr s 1 (1- pos)))))
+
+;;; Detect R/diameter prefix in a raw text string. Returns "R", "%%c", or "".
+(defun DQC:dim-prefix (s / su)
+  (setq s (DQC:trim s) su (strcase s))
+  (cond
+    ((= (strlen s) 0) "")
+    ((= (substr su 1 1) "R") "R")
+    ((and (>= (strlen su) 3)
+          (= (substr su 1 2) "%%")
+          (wcmatch (substr su 3 1) "C,D")) "%%c")
+    (T "")))
+
 
 ;;; ============================================================================
 ;;;  PART 2 – MTEXT FORMAT-CODE STRIPPER
@@ -164,8 +200,13 @@
              ((wcmatch nx "H,A,C,T,Q,W,F")
               (setq sc (DQC:find-char s ";" (+ i 2)))
               (if (= sc 0) (setq i (+ i 2)) (setq i (1+ sc))))
-             ;; \L \O \K \U – toggle codes, no argument
-             ((wcmatch nx "L,O,K,U")
+             ;; \U Unicode literal e.g. \U+2205
+             ((= nx "U")
+              (if (and (<= (+ i 6) (strlen s)) (= (substr s (+ i 2) 1) "+"))
+                (setq out (strcat out " ") i (+ i 7))
+                (setq i (+ i 2))))
+             ;; \L \O \K – toggle codes, no argument
+             ((wcmatch nx "L,O,K")
               (setq i (+ i 2)))
              ;; Unknown escape – skip the backslash, keep the char
              (T
@@ -341,7 +382,7 @@
               (setq m (if (> (strlen (DQC:drop-tol alt-s)) 0)
                         (DQC:parse-metric alt-s)
                         nil))
-              (list p (if m m 'EMPTY))))))))))
+              (list p (if m m 'EMPTY)))))))))
 
 
 ;;; ============================================================================
@@ -357,7 +398,9 @@
   (if (null ed) nil
     (progn
       (setq obj (vlax-ename->vla-object ename))
-      (if (wcmatch (cdr (assoc 0 ed)) "*LEADER")
+      (setq txpt (vl-catch-all-apply 'vlax-get (list obj 'TextPosition)))
+      (if (not (vl-catch-all-error-p txpt)) (setq pt txpt))
+      (if (and (null pt) (wcmatch (cdr (assoc 0 ed)) "*LEADER"))
         (progn
           (setq txpt (vl-catch-all-apply 'vlax-get (list obj 'TextLocation)))
           (if (not (vl-catch-all-error-p txpt)) (setq pt txpt))))
@@ -495,6 +538,8 @@
     (entlast)))
 
 
+
+
 ;;; ============================================================================
 ;;;  PART 6 – PROCESS ONE DIMENSION
 ;;;  Returns a list:
@@ -504,99 +549,158 @@
 
 (defun DQC:process (ename doc / obj ed meas sname lfac
                               primary-auto raw stripped pair
-                              primary alt expected ok
-                              txtpt txth dimang label layer
-                              ovr g1 alt-on)
+                              primary alt expected ok in-dp mm-dp pfx in-seg from-text
+                              txtpt txth dimang label layer entlay
+                              ts to g1 alt-on dimaltf flags70)
 
   (setq obj (vl-catch-all-apply 'vlax-ename->vla-object (list ename)))
   (if (vl-catch-all-error-p obj)
     (list 'SKIP "" nil nil nil "")
 
     (progn
-      ;; ── Read dim data ────────────────────────────────────────────────────
-      (setq ed    (vl-catch-all-apply 'entget (list ename)))
+      ;; ── Read dim entity data ─────────────────────────────────────────────
+      (setq ed (vl-catch-all-apply 'entget (list ename)))
       (if (vl-catch-all-error-p ed) (setq ed nil))
 
-      (setq meas  (if ed (cdr (assoc 42 ed)) nil))
+      ;; Skip our own balloon entities
+      (setq entlay (if ed (cdr (assoc 8 ed)) nil))
+      (if (and entlay
+               (or (= (strcase entlay) (strcase DQC:PASS-LAYER))
+                   (= (strcase entlay) (strcase DQC:FAIL-LAYER))))
+        (list 'SKIP "" nil nil nil "")
+
+      ;; ── else: not a balloon entity, proceed with processing ──────────────
+      (progn
+
+      (setq meas (if ed (cdr (assoc 42 ed)) nil))
       (if (null meas) (setq meas 0.0))
 
       (setq sname (DQC:dim-style ename)
             lfac  (DQC:lfac sname doc))
 
-      ;; The inch value AutoCAD would show when text uses <>
+      ;; Computed inch measurement
       (setq primary-auto (* (abs meas) lfac))
 
-      ;; ── Read raw text override ────────────────────────────────────────────
-      (setq ovr (vl-catch-all-apply 'vla-get-TextOverride (list obj)))
-      (if (or (vl-catch-all-error-p ovr) (null ovr) (= ovr ""))
-        (progn
-          (setq ovr (vl-catch-all-apply 'vla-get-TextString (list obj)))
-          (if (vl-catch-all-error-p ovr) (setq ovr ""))))
-      
+      ;; ── Strategy: collect all text sources and pick the best one ─────────
+      (setq ts (vl-catch-all-apply 'vlax-get (list obj 'TextString)))
+      (if (vl-catch-all-error-p ts) (setq ts ""))
+      (if (null ts) (setq ts ""))
+
+      (setq to (vl-catch-all-apply 'vlax-get (list obj 'TextOverride)))
+      (if (vl-catch-all-error-p to) (setq to ""))
+      (if (null to) (setq to ""))
+
       (setq g1 (if ed (cdr (assoc 1 ed)) nil))
       (if (null g1) (setq g1 ""))
 
-      (setq alt-on (vl-catch-all-apply 'vla-get-AlternateUnits (list obj)))
+      (setq alt-on (vl-catch-all-apply 'vlax-get (list obj 'AlternateUnits)))
       (if (vl-catch-all-error-p alt-on) (setq alt-on nil))
+      (if (and (null alt-on) ed)
+        (progn
+          (setq flags70 (cdr (assoc 70 ed)))
+          (if (and flags70 (= (logand flags70 2) 2))
+            (setq alt-on :vlax-true))))
 
-      ;; Prefer TextOverride/TextString; fall back to DXF 1; synthesize if Alternate Units are natively ON
-      (setq raw
-        (cond
-          ((> (strlen (DQC:trim ovr)) 0) ovr)
-          ((and (= (type g1) 'STR) (> (strlen (DQC:trim g1)) 0)) g1)
-          ((eq alt-on :vlax-true) "<> []")
-          (T "")))
+      (setq dimaltf (if ed (cdr (assoc 143 ed)) nil))
+      (if (or (null dimaltf) (zerop dimaltf)) (setq dimaltf DQC:MM/IN))
 
-      ;; Strip mtext codes; substitute <> with the auto inch value and [] with alt auto value
-      (setq stripped (DQC:strip raw primary-auto (* primary-auto DQC:MM/IN)))
+      ;; ── Try every text source until one parses successfully ────────────────
+      (setq pair nil from-text nil)
 
-      ;; Parse  "primary [alt]"
-      (setq pair (DQC:parse stripped))
+      ;; Attempt 1: TextString
+      (if (and (null pair) (> (strlen (DQC:trim ts)) 0))
+        (progn
+          (setq stripped ts)
+          (setq pair (DQC:parse stripped))
+          (if pair (setq from-text T))))
 
-      ;; ── Geometry: where is the dim text? ────────────────────────────────
+      ;; Attempt 2: TextOverride
+      (if (and (null pair) (> (strlen (DQC:trim to)) 0))
+        (progn
+          (setq stripped (DQC:strip to primary-auto (* primary-auto DQC:MM/IN)))
+          (setq pair (DQC:parse stripped))
+          (if pair (setq from-text T))))
+
+      ;; Attempt 3: DXF group 1
+      (if (and (null pair) (= (type g1) 'STR) (> (strlen (DQC:trim g1)) 0))
+        (progn
+          (setq stripped (DQC:strip g1 primary-auto (* primary-auto DQC:MM/IN)))
+          (setq pair (DQC:parse stripped))
+          (if pair (setq from-text T))))
+
+      ;; Attempt 4: Synthesise from measurement if DIMALT is on
+      (if (and (null pair) (or (eq alt-on :vlax-true) (= alt-on -1)))
+        (progn
+          (setq stripped (strcat (rtos primary-auto 2 6)
+                                " [" (rtos (* primary-auto dimaltf) 2 6) "]"))
+          (setq pair (DQC:parse stripped))))
+
+      ;; Attempt 5: Synthesise for all
+      (if (and (null pair) (> primary-auto 0.0001))
+        (progn
+          (setq stripped (strcat (rtos primary-auto 2 6)
+                                " [" (rtos (* primary-auto DQC:MM/IN) 2 6) "]"))
+          (setq pair (DQC:parse stripped))))
+
+      (setq raw (if stripped stripped ""))
+
+      ;; ── Detect R / diameter prefix ───────────────────────────────────────
+      (setq pfx (DQC:dim-prefix ts))
+      (if (= pfx "") (setq pfx (DQC:dim-prefix to)))
+      (if (= pfx "") (setq pfx (DQC:dim-prefix g1)))
+
+      ;; ── Decimal precision ────────────────────────────────────────────────
+      (if from-text
+        (progn
+          (setq in-seg (DQC:inch-seg stripped))
+          (setq in-dp  (DQC:count-dp in-seg)))
+        (progn
+          (setq in-dp (DQC:count-dp (rtos primary-auto 2 6)))
+          (setq in-dp (min in-dp 4))))
+      (setq mm-dp (max 1 (1- in-dp)))
+
+      ;; ── Geometry: where is the dim text? ─────────────────────────────────
       (setq txtpt (DQC:dim-textpt ename))
       (setq txth  (DQC:dim-txth  ename))
-      (setq dimang (vl-catch-all-apply 'vla-get-TextRotation (list obj)))
+      (setq dimang (vl-catch-all-apply 'vlax-get (list obj 'TextRotation)))
       (if (vl-catch-all-error-p dimang)
         (setq dimang (if ed (cdr (assoc 53 ed)) 0.0)))
       (if (null dimang) (setq dimang 0.0))
 
-      ;; ── Classify and place balloon ───────────────────────────────────────
+      ;; ── Classify and place balloon ────────────────────────────────────────
       (cond
-
-        ;; No [ ] bracket → single-unit dim → skip silently
         ((null pair)
          (list 'SKIP "" nil nil nil raw))
 
-        ;; Bracket present but mm slot is empty
         ((eq (cadr pair) 'EMPTY)
          (setq primary  (car pair)
                expected (* (abs primary) DQC:MM/IN)
-               label    (strcat (rtos primary 2 3) "\" [?] XX (exp " (rtos expected 2 2) ")")
+               label    (strcat pfx (rtos primary 2 in-dp) "\" [?] XX (exp " (rtos expected 2 mm-dp) ")")
                layer    DQC:FAIL-LAYER)
          (if txtpt
            (DQC:place-balloon txtpt txth dimang label layer))
          (list 'FAIL label primary nil expected raw))
 
-        ;; Both values present → verify
         (T
          (setq primary  (car  pair)
                alt      (cadr pair)
                expected (* (abs primary) DQC:MM/IN)
                ok       (DQC:ok? primary alt DQC:MM/IN))
          (if ok
-           (setq label (strcat (rtos primary 2 3) "\" [" (rtos alt 2 2) "] OK")
+           (setq label (strcat pfx (rtos primary 2 in-dp) "\" [" (rtos alt 2 mm-dp) "] OK")
                  layer DQC:PASS-LAYER)
-           (setq label (strcat (rtos primary 2 3) "\" [" (rtos alt 2 2) "] XX (exp " (rtos expected 2 2) ")")
+           (setq label (strcat pfx (rtos primary 2 in-dp) "\" [" (rtos alt 2 mm-dp) "] XX (exp " (rtos expected 2 mm-dp) ")")
                  layer DQC:FAIL-LAYER))
          (if txtpt
            (DQC:place-balloon txtpt txth dimang label layer))
          (list (if ok 'PASS 'FAIL) label
                primary alt expected raw))
-      )
-    )
-  )
-)
+      ) ;; close cond
+      ) ;; close progn (else branch of balloon-layer if)
+      ) ;; close if (balloon-layer check)
+    ) ;; close progn (else branch of obj-error if)
+  ) ;; close if (obj-error check)
+) ;; close defun
 
 
 ;;; ============================================================================
@@ -644,9 +748,9 @@
 
   (write-line "  : boxed_column {" f)
   (write-line "    label = \"Balloon key\";" f)
-  (write-line "    : text { label = \"  n.nn\\\" [nn.n] OK = PASS (on layer DIM_QC_PASS, colour green)\"; }" f)
-  (write-line "    : text { label = \"  n.nn\\\" [nn.n] XX  = FAIL wrong mm value (layer DIM_QC_FAIL, red)\"; }" f)
-  (write-line "    : text { label = \"  n.nn\\\" [?] XX     = FAIL mm bracket empty (layer DIM_QC_FAIL, red)\"; }" f)
+  (write-line "    : text { label = \"  n.nnin [nn.n] OK = PASS (on layer DIM_QC_PASS, colour green)\"; }" f)
+  (write-line "    : text { label = \"  n.nnin [nn.n] XX  = FAIL wrong mm value (layer DIM_QC_FAIL, red)\"; }" f)
+  (write-line "    : text { label = \"  n.nnin [?] XX     = FAIL mm bracket empty (layer DIM_QC_FAIL, red)\"; }" f)
   (write-line "    : text { label = \" \"; }" f)
   (write-line "    : text { label = \"To hide balloons: freeze layers DIM_QC_PASS and DIM_QC_FAIL\"; }" f)
   (write-line "    : text { label = \"To remove balloons: run  DIMQC-RESET\"; }" f)
@@ -737,10 +841,12 @@
   ;; ── 3. Remove any old balloons ───────────────────────────────────────────
   (DQC:erase-balloons doc)
 
-  ;; ── 4. Find all DIMENSION entities (and MULTILEADERs) ───────────────────
-  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER"))))
+  ;; ── 4. Find all dimension-like entities ──────────────────────────────────
+  ;; Include TEXT, MTEXT, LEADER to catch R-prefix radial callouts that
+  ;; are not created as native DIMENSION entities.
+  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
   (if (null ss)
-    (progn (alert "No DIMENSION entities found in this drawing.") (princ) (exit)))
+    (progn (alert "No dimension entities found in this drawing.") (princ) (exit)))
 
   (setq len   (sslength ss)
         total 0  pass 0  fail 0  skip 0
@@ -839,11 +945,11 @@
 
 (defun C:DIMQC-DIAG ( / doc ss len i ename obj ed sname lfac
                          meas raw stripped pair primary alt expected
-                         ovr2 g alt-on)
+                         ts to g alt-on dimaltf flags70)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
   (princ "\n========== DIMQC DIAGNOSTIC ==========\n")
-  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER"))))
-  (if (null ss) (progn (princ " No DIMENSION or MULTILEADER entities.\n\n") (princ) (exit)))
+  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
+  (if (null ss) (progn (princ " No entities found.\n\n") (princ) (exit)))
   (setq len (sslength ss))
   (princ (strcat " " (itoa len) " entities found.\n\n"))
   (setq i 0)
@@ -856,33 +962,68 @@
           lfac  (DQC:lfac sname doc)
           meas  (DQC:dim-meas ename))
     (if (null meas) (setq meas 0.0))
-    
-    (setq ovr2 (vl-catch-all-apply 'vla-get-TextOverride (list obj)))
-    (if (or (vl-catch-all-error-p ovr2) (null ovr2) (= ovr2 ""))
-      (progn
-        (setq ovr2 (vl-catch-all-apply 'vla-get-TextString (list obj)))
-        (if (vl-catch-all-error-p ovr2) (setq ovr2 ""))))
-        
+
+    (setq ts (vl-catch-all-apply 'vlax-get (list obj 'TextString)))
+    (if (vl-catch-all-error-p ts) (setq ts ""))
+    (if (null ts) (setq ts ""))
+
+    (setq to (vl-catch-all-apply 'vlax-get (list obj 'TextOverride)))
+    (if (vl-catch-all-error-p to) (setq to ""))
+    (if (null to) (setq to ""))
+
     (setq g (if ed (cdr (assoc 1 ed)) nil))
     (if (null g) (setq g ""))
-    
-    (setq alt-on (vl-catch-all-apply 'vla-get-AlternateUnits (list obj)))
-    (if (vl-catch-all-error-p alt-on) (setq alt-on nil))
 
-    (setq raw
-      (cond
-        ((> (strlen (DQC:trim ovr2)) 0) ovr2)
-        ((and (= (type g) 'STR) (> (strlen (DQC:trim g)) 0)) g)
-        ((eq alt-on :vlax-true) "<> []")
-        (T "")))
-        
-    (setq stripped (DQC:strip raw (* (abs meas) lfac) (* (* (abs meas) lfac) DQC:MM/IN)))
-    (setq pair     (DQC:parse stripped))
-    (princ (strcat "ITEM #" (itoa (1+ i)) " [" (cdr (assoc 0 ed)) "]\n"))
+    (setq alt-on (vl-catch-all-apply 'vlax-get (list obj 'AlternateUnits)))
+    (if (vl-catch-all-error-p alt-on) (setq alt-on nil))
+    (if (and (null alt-on) ed)
+      (progn
+        (setq flags70 (cdr (assoc 70 ed)))
+        (if (and flags70 (= (logand flags70 2) 2)) (setq alt-on :vlax-true))))
+
+    (setq dimaltf (if ed (cdr (assoc 143 ed)) nil))
+    (if (or (null dimaltf) (zerop dimaltf)) (setq dimaltf DQC:MM/IN))
+
+    ;; Try all sources (same logic as DQC:process)
+    (setq pair nil raw "" stripped "")
+
+    (if (and (null pair) (> (strlen (DQC:trim ts)) 0))
+      (progn
+        (setq stripped ts raw (strcat "TextString: " ts))
+        (setq pair (DQC:parse stripped))))
+
+    (if (and (null pair) (> (strlen (DQC:trim to)) 0))
+      (progn
+        (setq stripped (DQC:strip to (* (abs meas) lfac) (* (* (abs meas) lfac) DQC:MM/IN)))
+        (setq raw (strcat "TextOverride: " stripped))
+        (setq pair (DQC:parse stripped))))
+
+    (if (and (null pair) (= (type g) 'STR) (> (strlen (DQC:trim g)) 0))
+      (progn
+        (setq stripped (DQC:strip g (* (abs meas) lfac) (* (* (abs meas) lfac) DQC:MM/IN)))
+        (setq raw (strcat "DXF1: " stripped))
+        (setq pair (DQC:parse stripped))))
+
+    (if (and (null pair) (or (eq alt-on :vlax-true) (= alt-on -1)))
+      (progn
+        (setq stripped (strcat (rtos (* (abs meas) lfac) 2 6)
+                               " [" (rtos (* (* (abs meas) lfac) dimaltf) 2 6) "]"))
+        (setq raw (strcat "DIMALT synth: " stripped))
+        (setq pair (DQC:parse stripped))))
+
+    (if (and (null pair) (> (* (abs meas) lfac) 0.0001))
+      (progn
+        (setq stripped (strcat (rtos (* (abs meas) lfac) 2 6)
+                               " [" (rtos (* (* (abs meas) lfac) DQC:MM/IN) 2 6) "]"))
+        (setq raw (strcat "Meas synth: " stripped))
+        (setq pair (DQC:parse stripped))))
+    (princ (strcat "ITEM #" (itoa (1+ i)) " [" (if ed (cdr (assoc 0 ed)) "?") "]\n"))
     (princ (strcat "  Style   : " (if sname sname "?") "\n"))
-    (princ (strcat "  VLA txt : \"" ovr2 "\"\n"))
+    (princ (strcat "  TextStr : \"" ts "\"\n"))
+    (princ (strcat "  TextOvr : \"" to "\"\n"))
     (princ (strcat "  DXF 1   : \"" (if (= (type g) 'STR) g "") "\"\n"))
-    (princ (strcat "  Raw used: \"" raw "\"\n"))
+    (princ (strcat "  DIMALT  : " (if alt-on (vl-princ-to-string alt-on) "nil") "\n"))
+    (princ (strcat "  Raw     : \"" raw "\"\n"))
     (princ (strcat "  Stripped: \"" stripped "\"\n"))
     (princ (strcat "  Meas    : " (rtos meas 2 6) "\n"))
     (princ (strcat "  LFAC    : " (rtos lfac 2 4) "\n"))
