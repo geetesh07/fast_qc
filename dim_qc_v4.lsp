@@ -1,23 +1,10 @@
 ;;; ============================================================================
-;;;  dim_qc_v5.lsp  -  Engineering Dual-Unit Dimension QC  (Balloon Edition)
+;;;  dim_qc_v5.lsp  -  Engineering Dual-Unit Dimension QC
 ;;;  Version 5.0
 ;;;
-;;;  FIXES vs 4.4:
-;;;    - Accuracy: DQC:ok? now uses AND (not OR) so the 0.08 mm absolute gate
-;;;      is ALWAYS enforced. Old OR let 3 % relative tolerance accept a 2 mm
-;;;      error on a 717 mm dimension. Now 28.229" [719.02] -> FAIL.
-;;;    - Trailing zeros: DQC:dimdec falls back to live DIMDEC system variable
-;;;      instead of returning nil. Hard-coded default of 3 removed. This stops
-;;;      8.50 from inflating to 8.500 when the VLA style read failed.
-;;;    - Tolerances (full-proof): DQC:extract-tol now cascades through
-;;;        (a) ~...~ stacked blocks (\S format codes) - existing
-;;;        (b) %%p<num> symmetric plus/minus plain text     - NEW
-;;;        (c) +<num>/<sep>-<num> asymmetric plain text     - NEW
-;;;      All three patterns are detected on both inch and mm sides.
-;;;
 ;;;  COMMANDS
-;;;    DIMQC        Open settings GUI -> run check -> place balloons
-;;;    DIMQC-RESET  Erase all balloons
+;;;    DIMQC        Open settings GUI -> run check -> place marks
+;;;    DIMQC-RESET  Erase all marks
 ;;;    DIMQC-DIAG   Command-line diagnostic
 ;;;
 ;;;  LAYERS
@@ -384,7 +371,7 @@
       (T           (setq out (strcat out ch) i (1+ i)))))
   out)
 
-;;; Strip leading non-numeric prefix (R, %%c, space etc.). Stop at digit/./-.
+;;; Strip leading non-numeric prefix (R, %%c, space etc.). Stop at digit/./-. 
 (defun DQC:strip-pfx (tok / i c)
   (setq tok (DQC:trim tok) i 1)
   (while (and (<= (+ i 1) (strlen tok))
@@ -547,7 +534,11 @@
 
 
 ;;; ============================================================================
-;;;  PART 6 - BALLOON PLACEMENT
+;;;  PART 6 - MARK PLACEMENT
+;;;
+;;;  Places a green tick (PASS) or red cross + expected value (FAIL)
+;;;  directly above the dimension text.  Default offset is purely
+;;;  perpendicular to the dim line (offx=0) so marks sit right above.
 ;;; ============================================================================
 
 (defun DQC:rot2 (dx dy ang / ca sa)
@@ -560,8 +551,9 @@
              DQC:TXT-H
              (* txth 0.85)))
   (if (< bh 0.5) (setq bh 0.5))
-  (setq offx (* (if (and DQC:OFFSET (> DQC:OFFSET 0))
-                  DQC:OFFSET (* bh 2.5)) 1.0)
+  ;; offx = 0 by default -> mark sits directly above the dim text
+  ;; User can override with the Offset setting in the dialog
+  (setq offx (if (and DQC:OFFSET (> DQC:OFFSET 0)) DQC:OFFSET 0.0)
         offy (* bh 1.2))
   (setq ovec (DQC:rot2 offx offy (if dimang dimang 0.0)))
   (setq ins (list (+ (car  txtpt) (car  ovec))
@@ -643,6 +635,16 @@
         (setq dimaltf (if ed (cdr (assoc 143 ed)) nil))
         (if (or (null dimaltf) (zerop dimaltf)) (setq dimaltf DQC:MM/IN))
 
+        ;; ---- Skip TAPER callouts -----------------------------------------
+        ;; Text like "TAPER .750 PER FT ON DIA.[1:16]" has brackets that contain
+        ;; a ratio, not a metric value.  Skip the entire entity if "TAPER" appears
+        ;; anywhere in any text source.
+        (if (or (wcmatch (strcase ts) "*TAPER*")
+                (wcmatch (strcase to) "*TAPER*")
+                (wcmatch (strcase g1) "*TAPER*"))
+          (list 'SKIP "" nil nil nil "TAPER callout - skipped")
+
+        (progn
         ;; ---- Parse attempts ---------------------------------------------
         (setq pair nil from-text nil from-meas-sub nil stripped "" raw "")
 
@@ -736,7 +738,7 @@
           (setq dimang (if ed (cdr (assoc 53 ed)) 0.0)))
         (if (null dimang) (setq dimang 0.0))
 
-        ;; ---- Classify and place balloon --------------------------------
+        ;; ---- Classify and place mark -----------------------------------
         (cond
           ((null pair)
            (list 'SKIP "" nil nil nil raw))
@@ -744,8 +746,9 @@
           ((eq (cadr pair) 'EMPTY)
            (setq primary  (car pair)
                  expected (* (abs primary) DQC:MM/IN)
-                 label    (strcat pfx (DQC:fmt primary in-dp)
-                                  "\" [?] XX (exp " (DQC:fmt expected mm-dp) ")"
+                 label    (strcat "{\\fArial|b1|i0;\\U+2717} "
+                                  pfx (DQC:fmt primary in-dp)
+                                  "\" [?] exp " (DQC:fmt expected mm-dp)
                                   tol-str)
                  layer    DQC:FAIL-LAYER)
            (if txtpt (DQC:place-balloon txtpt txth dimang label layer))
@@ -757,12 +760,12 @@
                  expected (* (abs primary) DQC:MM/IN)
                  ok       (DQC:ok? primary alt DQC:MM/IN))
            (if ok
-             (setq label (strcat pfx (DQC:fmt primary in-dp)
-                                 "\" [" (DQC:fmt alt mm-dp) "] OK" tol-str)
+             (setq label "{\\fArial|b1|i0;\\U+2713}"
                    layer DQC:PASS-LAYER)
-             (setq label (strcat pfx (DQC:fmt primary in-dp)
+             (setq label (strcat "{\\fArial|b1|i0;\\U+2717} "
+                                 pfx (DQC:fmt primary in-dp)
                                  "\" [" (DQC:fmt alt mm-dp)
-                                 "] XX (exp " (DQC:fmt expected mm-dp) ")" tol-str)
+                                 "] exp " (DQC:fmt expected mm-dp) tol-str)
                    layer DQC:FAIL-LAYER))
            (if txtpt (DQC:place-balloon txtpt txth dimang label layer))
            (list (if ok 'PASS 'FAIL) label primary alt expected raw))
@@ -781,7 +784,7 @@
   (setq path (strcat (getvar "TEMPPREFIX") "dim_qc_v4.dcl"))
   (setq f (open path "w"))
   (write-line "dqc_settings : dialog {" f)
-  (write-line "  label = \"DIM QC v5.0  -  Balloon Edition\";" f)
+  (write-line "  label = \"DIM QC v5.0  -  Tick / Cross Edition\";" f)
   (write-line "  : boxed_column {" f)
   (write-line "    label = \"Conversion factor\";" f)
   (write-line "    : row {" f)
@@ -801,7 +804,7 @@
   (write-line "    }" f)
   (write-line "  }" f)
   (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Balloon size  (0 = auto from dim style)\";" f)
+  (write-line "    label = \"Mark size  (0 = auto from dim style)\";" f)
   (write-line "    : row {" f)
   (write-line "      : text  { label = \"Text height  (0 = auto):        \"; }" f)
   (write-line "      : edit_box { key = \"txth\"; width = 8; }" f)
@@ -812,15 +815,14 @@
   (write-line "    }" f)
   (write-line "  }" f)
   (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Balloon key\";" f)
-  (write-line "    : text { label = \"  .311\\\" [7.90] OK [+.010/-.000 | +.25/-.00] = PASS\"; }" f)
-  (write-line "    : text { label = \"  .311\\\" [7.85] XX (exp 7.90) [tol...]       = FAIL\"; }" f)
-  (write-line "    : text { label = \"  .311\\\" [?]   XX (exp 7.90)                 = EMPTY\"; }" f)
-  (write-line "    : text { label = \"Tolerances shown informational; QC is on nominal only.\"; }" f)
+  (write-line "    label = \"Result key\";" f)
+  (write-line "    : text { label = \"  PASS:  green tick placed above dimension\"; }" f)
+  (write-line "    : text { label = \"  FAIL:  red cross + expected value shown\"; }" f)
+  (write-line "    : text { label = \"  EMPTY: red cross + [?] when mm missing\"; }" f)
   (write-line "    : text { label = \"Freeze DIM_QC_PASS/FAIL to hide.  DIMQC-RESET removes.\"; }" f)
   (write-line "  }" f)
   (write-line "  : row {" f)
-  (write-line "    : button { key = \"run\";    label = \"Run QC + Place Balloons\"; is_default = true; width = 24; }" f)
+  (write-line "    : button { key = \"run\";    label = \"Run QC\"; is_default = true; width = 24; }" f)
   (write-line "    : button { key = \"cancel\"; label = \"Cancel\"; is_cancel = true; width = 12; }" f)
   (write-line "  }" f)
   (write-line "}" f)
@@ -835,7 +837,7 @@
   (write-line "    width      = 72;" f)
   (write-line "    multiple_select = false;" f)
   (write-line "  }" f)
-  (write-line "  : text { label = \"Balloons placed in drawing.  Plot as normal.\"; }" f)
+  (write-line "  : text { label = \"Green ticks (PASS) and red marks (FAIL) placed near dimensions.\"; }" f)
   (write-line "  : text { label = \"Freeze DIM_QC_PASS / DIM_QC_FAIL to hide.  DIMQC-RESET to remove.\"; }" f)
   (write-line "  ok_cancel;" f)
   (write-line "}" f)
@@ -964,7 +966,7 @@
                (vl-catch-all-apply 'entdel (list (ssname ss i)))
                (setq n (1+ n) i (1+ i))))))
   (vla-Regen doc acAllViewports)
-  (princ (strcat "\n Removed " (itoa n) " balloon(s).\n\n"))
+  (princ (strcat "\n Removed " (itoa n) " mark(s).\n\n"))
   (princ))
 
 
@@ -1086,18 +1088,10 @@
 ;;; ============================================================================
 (princ "\n")
 (princ "================================================\n")
-(princ " DIM QC v5.0  (Balloon Edition)  loaded.\n")
+(princ " DIM QC v5.0 Loaded.\n")
 (princ "\n")
 (princ "   DIMQC        Open GUI and run QC check\n")
-(princ "   DIMQC-RESET  Remove all balloons\n")
+(princ "   DIMQC-RESET  Remove all marks\n")
 (princ "   DIMQC-DIAG   Command-line diagnostic\n")
-(princ "\n")
-(princ " v5.0 fixes:\n")
-(princ "   - Accuracy: AND logic in DQC:ok? - 0.08 mm gate\n")
-(princ "     always enforced. 28.229\"[719.02] now FAILS.\n")
-(princ "   - Trailing zeros: DQC:dimdec reads live DIMDEC.\n")
-(princ "     8.50 stays 8.50, no spurious extra zeros.\n")
-(princ "   - Tolerances: plain text +val/-val and %%p\n")
-(princ "     now detected in addition to stacked \\S blocks.\n")
 (princ "================================================\n\n")
 (princ)
