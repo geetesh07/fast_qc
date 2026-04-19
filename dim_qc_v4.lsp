@@ -1,16 +1,19 @@
 ;;; ============================================================================
-;;;  dim_qc_v4.lsp  -  Engineering Dual-Unit Dimension QC  (Balloon Edition)
-;;;  Version 4.4
+;;;  dim_qc_v5.lsp  -  Engineering Dual-Unit Dimension QC  (Balloon Edition)
+;;;  Version 5.0
 ;;;
-;;;  FIXES vs 4.3:
-;;;    - Precision: raw token string used to count dp, not the atof'd value.
-;;;      "6.2195" stays "6.2195", "6.00" stays "6.00" – no rounding, no padding.
-;;;      Fixed variable-reuse bug where in-dp was trashed by DQC:find-char call.
-;;;    - Tolerances: \S+.010^-.000; stacked fractions are now parsed and shown
-;;;      in the balloon label as +.010/-.000 for both inch and mm sides.
-;;;      Tolerance check uses the nominal value only (tolerances are informational).
-;;;    - Position: MText entities use DXF 10 directly (no TextPosition which
-;;;      returns 0,0,0 on non-DIMENSION entities).
+;;;  FIXES vs 4.4:
+;;;    - Accuracy: DQC:ok? now uses AND (not OR) so the 0.08 mm absolute gate
+;;;      is ALWAYS enforced. Old OR let 3 % relative tolerance accept a 2 mm
+;;;      error on a 717 mm dimension. Now 28.229" [719.02] -> FAIL.
+;;;    - Trailing zeros: DQC:dimdec falls back to live DIMDEC system variable
+;;;      instead of returning nil. Hard-coded default of 3 removed. This stops
+;;;      8.50 from inflating to 8.500 when the VLA style read failed.
+;;;    - Tolerances (full-proof): DQC:extract-tol now cascades through
+;;;        (a) ~...~ stacked blocks (\S format codes) - existing
+;;;        (b) %%p<num> symmetric plus/minus plain text     - NEW
+;;;        (c) +<num>/<sep>-<num> asymmetric plain text     - NEW
+;;;      All three patterns are detected on both inch and mm sides.
 ;;;
 ;;;  COMMANDS
 ;;;    DIMQC        Open settings GUI -> run check -> place balloons
@@ -54,13 +57,16 @@
   (if (<= i (strlen s)) i 0))
 
 (defun DQC:ok? (primary alt factor / exp diff)
+  ;; BOTH conditions must hold (AND, not OR).
+  ;; With OR the 3 % relative gate used to pass a 2 mm error on a 717 mm dim.
+  ;; With AND the absolute gate (0.08 mm) is always enforced regardless of size.
   (if (< (abs primary) 1e-9)
     (< (abs alt) 0.1)
     (progn
       (setq exp  (* (abs primary) factor)
             diff (abs (- exp (abs alt))))
-      (or (<= (/ diff exp) DQC:REL-TOL)
-          (<= diff DQC:ABS-TOL)))))
+      (and (<= (/ diff exp) DQC:REL-TOL)
+           (<= diff DQC:ABS-TOL)))))
 
 (defun DQC:ensure-layer (name aci doc / layers lay)
   (setq layers (vla-get-Layers doc))
@@ -120,19 +126,22 @@
 (defun DQC:fmt (val dp)
   (rtos val 2 dp))
 
-;;; Read DIMDEC from named dim style. Returns integer or nil.
-(defun DQC:dimdec (sname doc / styles sobj dec)
-  (if (null sname) nil
+;;; Read DIMDEC from named dim style.
+;;; Falls back to the live DIMDEC system variable so we NEVER return nil.
+;;; (nil caused style-dp to default to hard-coded 3 -> spurious trailing zeros)
+(defun DQC:dimdec (sname doc / styles sobj dec live)
+  (setq live (fix (getvar "DIMDEC")))
+  (if (null sname) live
     (progn
       (setq styles (vl-catch-all-apply 'vla-get-DimStyles (list doc)))
-      (if (vl-catch-all-error-p styles) nil
+      (if (vl-catch-all-error-p styles) live
         (progn
           (setq sobj (vl-catch-all-apply 'vla-item (list styles sname)))
-          (if (vl-catch-all-error-p sobj) nil
+          (if (vl-catch-all-error-p sobj) live
             (progn
               (setq dec (vl-catch-all-apply
                           'vlax-get (list sobj 'PrimaryUnitsPrecision)))
-              (if (or (vl-catch-all-error-p dec) (null dec)) nil
+              (if (or (vl-catch-all-error-p dec) (null dec)) live
                 (fix dec)))))))))
 
 
@@ -253,15 +262,99 @@
 
 ;;; Extract first tolerance block from a stripped string segment.
 ;;; Returns (hi-str lo-str) or nil.
-(defun DQC:extract-tol (s / t1 t2 content)
+;;;
+;;; Strategy (in order):
+;;;   1. ~...~ stacked block  (from \S format codes)  already the main path
+;;;   2. %%p<num>             symmetric plus/minus
+;;;   3. +<num>/<sep>-<num>  explicit asymmetric plain text
+(defun DQC:extract-tol (s / t1 t2 content result)
   (setq t1 (DQC:find-char s "~" 1))
-  (if (= t1 0) nil
+  (if (= t1 0)
+    ;; No stacked block - fall through to plain-text patterns
+    (DQC:extract-plain-tol s)
     (progn
       (setq t2 (DQC:find-char s "~" (1+ t1)))
-      (if (= t2 0) nil
+      (if (= t2 0)
+        (DQC:extract-plain-tol s)
         (progn
           (setq content (substr s (1+ t1) (- t2 t1 1)))
-          (DQC:parse-tol-block content))))))
+          (setq result (DQC:parse-tol-block content))
+          (if result result
+            ;; Stacked block was malformed - try plain text
+            (DQC:extract-plain-tol s)))))))
+
+;;; Scan s for plain-text tolerance patterns.
+;;; Handles:
+;;;   %%p<num>           ->  ("+<num>" "-<num>")   symmetric (plus/minus glyph)
+;;;   +<num>/<sep>-<num> ->  ("+<num>" "-<num>")   asymmetric (after nominal)
+;;; Returns (hi-str lo-str) or nil.
+(defun DQC:extract-plain-tol (s / su i j c hi lo num-s found)
+  (setq su (strcase s) i 1 found nil)
+
+  ;; --- 1. %%P (plus/minus) symmetric ---
+  (setq j 1)
+  (while (and (<= j (- (strlen su) 2)) (null found))
+    (if (and (= (substr su j 1) "%")
+             (= (substr su (+ j 1) 1) "%")
+             (= (substr su (+ j 2) 1) "P"))
+      (progn
+        (setq i (+ j 3) num-s "")
+        ;; skip optional space
+        (while (and (<= i (strlen s)) (= (substr s i 1) " "))
+          (setq i (1+ i)))
+        ;; read optional leading sign
+        (if (and (<= i (strlen s)) (wcmatch (substr s i 1) "-,+"))
+          (setq num-s (strcat num-s (substr s i 1)) i (1+ i)))
+        ;; read digits
+        (while (and (<= i (strlen s))
+                    (or (wcmatch (substr s i 1) "#") (= (substr s i 1) ".")))
+          (setq num-s (strcat num-s (substr s i 1)) i (1+ i)))
+        (if (> (strlen num-s) 0)
+          (progn
+            ;; strip any leading minus for a clean absolute value
+            (setq num-s
+              (if (= (substr num-s 1 1) "-") (substr num-s 2) num-s))
+            (setq found (list (strcat "+" num-s) (strcat "-" num-s))))
+          (setq j (1+ j))))
+      (setq j (1+ j))))
+
+  ;; --- 2. +<hi>/<sep>-<lo> explicit asymmetric ---
+  (if (null found)
+    (progn
+      (setq i 1)
+      (while (and (<= i (strlen s)) (null found))
+        (setq c (substr s i 1))
+        (cond
+          ((= c "+")
+           ;; read hi value
+           (setq j (1+ i) hi "+")
+           (while (and (<= j (strlen s))
+                       (or (wcmatch (substr s j 1) "#") (= (substr s j 1) ".")))
+             (setq hi (strcat hi (substr s j 1)) j (1+ j)))
+           (if (> (strlen hi) 1)   ; at least one digit after +
+             (progn
+               ;; skip separator chars: / ^ space | line-break
+               (while (and (<= j (strlen s))
+                           (or (= (substr s j 1) "/")
+                               (= (substr s j 1) "^")
+                               (= (substr s j 1) " ")
+                               (= (substr s j 1) "|")))
+                 (setq j (1+ j)))
+               ;; must be followed by -lo to qualify
+               (if (and (<= j (strlen s)) (= (substr s j 1) "-"))
+                 (progn
+                   (setq lo "-" j (1+ j))
+                   (while (and (<= j (strlen s))
+                               (or (wcmatch (substr s j 1) "#") (= (substr s j 1) ".")))
+                     (setq lo (strcat lo (substr s j 1)) j (1+ j)))
+                   (if (> (strlen lo) 1)
+                     (setq found (list hi lo))
+                     (setq i (1+ i))))
+                 (setq i (1+ i))))
+             (setq i (1+ i))))
+          (T (setq i (1+ i)))))))
+  found)
+
 
 ;;; Format a tolerance pair as a compact string for the balloon label.
 ;;; ("+.010" "-.000") -> " +.010/-.000"
@@ -607,7 +700,10 @@
         ;; Use bracket-pos (separate variable!) to find "[" - do NOT reuse
         ;; in-dp as a scratch variable before calling count-dp-in-token.
         (setq style-dp (DQC:dimdec sname doc))
-        (if (null style-dp) (setq style-dp 3))
+        ;; DQC:dimdec now always returns an integer (falls back to DIMDEC sysvar)
+        ;; but guard defensively to avoid using a nil/0 value
+        (if (or (null style-dp) (< style-dp 0))
+          (setq style-dp (fix (getvar "DIMDEC"))))
 
         (if (and from-text (not from-meas-sub))
           (progn
@@ -685,7 +781,7 @@
   (setq path (strcat (getvar "TEMPPREFIX") "dim_qc_v4.dcl"))
   (setq f (open path "w"))
   (write-line "dqc_settings : dialog {" f)
-  (write-line "  label = \"DIM QC v4.4  -  Balloon Edition\";" f)
+  (write-line "  label = \"DIM QC v5.0  -  Balloon Edition\";" f)
   (write-line "  : boxed_column {" f)
   (write-line "    label = \"Conversion factor\";" f)
   (write-line "    : row {" f)
@@ -730,7 +826,7 @@
   (write-line "}" f)
   (write-line "" f)
   (write-line "dqc_results : dialog {" f)
-  (write-line "  label = \"DIM QC v4.4  -  Results\";" f)
+  (write-line "  label = \"DIM QC v5.0  -  Results\";" f)
   (write-line "  : text { key = \"sum_line\"; label = \" \"; }" f)
   (write-line "  : list_box {" f)
   (write-line "    key        = \"res_list\";" f)
@@ -880,7 +976,7 @@
                          meas raw stripped pair primary alt expected
                          ts to g alt-on dimaltf flags70)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
-  (princ "\n========== DIMQC DIAGNOSTIC v4.4 ==========\n")
+  (princ "\n========== DIMQC DIAGNOSTIC v5.0 ==========\n")
   (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
   (if (null ss) (progn (princ " No entities found.\n\n") (princ) (exit)))
   (setq len (sslength ss))
@@ -990,17 +1086,18 @@
 ;;; ============================================================================
 (princ "\n")
 (princ "================================================\n")
-(princ " DIM QC v4.4  (Balloon Edition)  loaded.\n")
+(princ " DIM QC v5.0  (Balloon Edition)  loaded.\n")
 (princ "\n")
 (princ "   DIMQC        Open GUI and run QC check\n")
 (princ "   DIMQC-RESET  Remove all balloons\n")
 (princ "   DIMQC-DIAG   Command-line diagnostic\n")
 (princ "\n")
-(princ " v4.4 fixes:\n")
-(princ "   - 6.2195 stays 6.2195, 6.00 stays 6.00\n")
-(princ "     (bracket-pos bug fixed; raw token string counted)\n")
-(princ "   - Tolerances in balloon: +.010/-.000 | +.25/-.00\n")
-(princ "     (parsed from \\S stacked fractions, both sides)\n")
-(princ "   - Works for rotated dims and MText tolerances too\n")
+(princ " v5.0 fixes:\n")
+(princ "   - Accuracy: AND logic in DQC:ok? - 0.08 mm gate\n")
+(princ "     always enforced. 28.229\"[719.02] now FAILS.\n")
+(princ "   - Trailing zeros: DQC:dimdec reads live DIMDEC.\n")
+(princ "     8.50 stays 8.50, no spurious extra zeros.\n")
+(princ "   - Tolerances: plain text +val/-val and %%p\n")
+(princ "     now detected in addition to stacked \\S blocks.\n")
 (princ "================================================\n\n")
 (princ)
