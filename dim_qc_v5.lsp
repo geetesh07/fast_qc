@@ -29,31 +29,32 @@
 ;;;  PART 1 - UTILITIES
 ;;; ============================================================================
 
-(defun DQC:trim (s)
-  (if (or (null s) (/= (type s) 'STR)) (setq s ""))
-  (while (and (> (strlen s) 0) (= (substr s 1 1) " "))
-    (setq s (substr s 2)))
-  (while (and (> (strlen s) 0) (= (substr s (strlen s) 1) " "))
-    (setq s (substr s 1 (1- (strlen s)))))
-  s)
+(defun DQC:trim (s) (if (or (null s) (/= (type s) 'STR)) "" (vl-string-trim " " s)))
 
-(defun DQC:find-char (s c pos / i)
-  (setq i pos)
-  (while (and (<= i (strlen s)) (/= (substr s i 1) c))
-    (setq i (1+ i)))
-  (if (<= i (strlen s)) i 0))
+(defun DQC:find-char (s c pos / p)
+  (if (setq p (vl-string-search c s (1- pos))) (1+ p) 0))
 
 (defun DQC:ok? (primary alt factor / exp diff)
   ;; BOTH conditions must hold (AND, not OR).
-  ;; With OR the 3 % relative gate used to pass a 2 mm error on a 717 mm dim.
-  ;; With AND the absolute gate (0.08 mm) is always enforced regardless of size.
   (if (< (abs primary) 1e-9)
     (< (abs alt) 0.1)
     (progn
       (setq exp  (* (abs primary) factor)
             diff (abs (- exp (abs alt))))
-      (and (<= (/ diff exp) DQC:REL-TOL)
-           (<= diff DQC:ABS-TOL)))))
+      (if (equal factor 25.4 1e-5)
+        (and (<= (/ diff exp) DQC:REL-TOL)
+             (<= diff DQC:ABS-TOL))
+        (<= (/ diff exp) DQC:REL-TOL)))))
+
+(defun DQC:get-factor (prim alt / combined)
+  (setq combined (strcase (strcat (if prim prim "") " " (if alt alt ""))))
+  (cond
+    ((wcmatch combined "*FT*LB*") (list 1.355818 "N-m"))
+    ((wcmatch combined "*IN*LB*") (list 0.112985 "N-m"))
+    ((or (wcmatch combined "*LB*") (wcmatch combined "*LBS*")) (list 0.453592 "kg"))
+    ((wcmatch combined "*PSI*")   (list 6.89476 "kPa"))
+    ((wcmatch combined "*HP*")    (list 0.7457 "kW"))
+    (T (list 25.4 "mm"))))
 
 (defun DQC:ensure-layer (name aci doc / layers lay)
   (setq layers (vla-get-Layers doc))
@@ -371,20 +372,33 @@
       (T           (setq out (strcat out ch) i (1+ i)))))
   out)
 
-;;; Strip leading non-numeric prefix (R, %%c, space etc.). Stop at digit/./-. 
-(defun DQC:strip-pfx (tok / i c)
-  (setq tok (DQC:trim tok) i 1)
-  (while (and (<= (+ i 1) (strlen tok))
-              (= (substr tok i 1) "%")
-              (= (substr tok (1+ i) 1) "%"))
-    (setq i (+ i 3)))
-  (while (and (<= i (strlen tok))
-              (setq c (substr tok i 1))
-              (not (wcmatch c "#"))
-              (/= c "-")
-              (/= c "."))
-    (setq i (1+ i)))
-  (if (> i (strlen tok)) "" (substr tok i)))
+;;; Strip known dimension prefixes (R, SR, S, M, %%c/C, DIA) and spaces.
+;;; Stops false dimension detection on MText notes like "ITEM 4 [8]".
+(defun DQC:strip-pfx (tok / su orig cur iter)
+  (setq cur (vl-string-trim " \t" tok))
+  (setq iter 0)
+  (while (< iter 5)
+    (setq su (strcase cur) orig cur)
+    (cond
+      ((wcmatch su "R#*")    (setq cur (substr cur 2)))
+      ((wcmatch su "R.*")    (setq cur (substr cur 2)))
+      ((wcmatch su "R *")    (setq cur (substr cur 2)))
+      ((wcmatch su "SR#*")   (setq cur (substr cur 3)))
+      ((wcmatch su "SR.*")   (setq cur (substr cur 3)))
+      ((wcmatch su "SR *")   (setq cur (substr cur 3)))
+      ((wcmatch su "S#*")    (setq cur (substr cur 2)))
+      ((wcmatch su "S.*")    (setq cur (substr cur 2)))
+      ((wcmatch su "S *")    (setq cur (substr cur 2)))
+      ((wcmatch su "M#*")    (setq cur (substr cur 2)))
+      ((wcmatch su "M.*")    (setq cur (substr cur 2)))
+      ((wcmatch su "DIA*")   (setq cur (substr cur 4)))
+      ((wcmatch su "%%C*")   (setq cur (substr cur 4)))
+      ((wcmatch su "%%?*")   (setq cur (substr cur 4)))
+    )
+    (setq cur (vl-string-trim " \t" cur))
+    (if (= orig cur) (setq iter 5) (setq iter (1+ iter)))
+  )
+  cur)
 
 ;;; Parse nominal number from a token (drops tolerance wrappers, strips prefix).
 (defun DQC:first-num (tok / v)
@@ -546,21 +560,23 @@
   (list (- (* dx ca) (* dy sa))
         (+ (* dx sa) (* dy ca))))
 
-(defun DQC:place-balloon (txtpt txth dimang label layer / bh offx offy ovec ins bw ent-data)
+(defun DQC:place-balloon (txtpt txth dimang label layer / bh bw offx offy ovec ins ent-data)
   (setq bh (if (and DQC:TXT-H (> DQC:TXT-H 0))
              DQC:TXT-H
              (* txth 0.85)))
   (if (< bh 0.5) (setq bh 0.5))
   ;; offx = 0 by default -> mark sits directly above the dim text
-  ;; User can override with the Offset setting in the dialog
+  ;; offy reduced to 0.7 to sit much closer to the text
   (setq offx (if (and DQC:OFFSET (> DQC:OFFSET 0)) DQC:OFFSET 0.0)
-        offy (* bh 1.2))
+        offy (* bh 0.7))
   (setq ovec (DQC:rot2 offx offy (if dimang dimang 0.0)))
   (setq ins (list (+ (car  txtpt) (car  ovec))
                   (+ (cadr txtpt) (cadr ovec))
                   (if (caddr txtpt) (caddr txtpt) 0.0)))
-  (setq bw (* (strlen label) bh 0.7))
-  (if (< bw (* bh 3)) (setq bw (* bh 3)))
+
+  (setq bw (* (strlen label) bh 0.8))
+  (if (< bw (* bh 3.0)) (setq bw (* bh 3.0)))
+
   (setq ent-data
     (list (cons 0   "MTEXT")
           (cons 100 "AcDbEntity")
@@ -568,8 +584,8 @@
           (cons 100 "AcDbMText")
           (cons 10  ins)
           (cons 40  bh)
-          (cons 41  bw)
-          (cons 71  7)
+          (cons 41  bw)   ; Provide explicit width to prevent entmake degeneracy failures
+          (cons 71  8)    ; 8 = Bottom Center
           (cons 72  1)
           (cons 1   label)))
   (if (vl-catch-all-error-p (vl-catch-all-apply 'entmake (list ent-data)))
@@ -739,16 +755,20 @@
         (if (null dimang) (setq dimang 0.0))
 
         ;; ---- Classify and place mark -----------------------------------
+        (setq unit-data (DQC:get-factor stripped "")
+              factor    (car unit-data)
+              unit-str  (cadr unit-data))
+
         (cond
           ((null pair)
            (list 'SKIP "" nil nil nil raw))
 
           ((eq (cadr pair) 'EMPTY)
            (setq primary  (car pair)
-                 expected (* (abs primary) DQC:MM/IN)
+                 expected (* (abs primary) factor)
                  label    (strcat "{\\fArial|b1|i0;\\U+2717} "
                                   pfx (DQC:fmt primary in-dp)
-                                  "\" [?] exp " (DQC:fmt expected mm-dp)
+                                  " [?] exp " (DQC:fmt expected mm-dp) " " unit-str
                                   tol-str)
                  layer    DQC:FAIL-LAYER)
            (if txtpt (DQC:place-balloon txtpt txth dimang label layer))
@@ -757,19 +777,20 @@
           (T
            (setq primary  (car  pair)
                  alt      (cadr pair)
-                 expected (* (abs primary) DQC:MM/IN)
-                 ok       (DQC:ok? primary alt DQC:MM/IN))
+                 expected (* (abs primary) factor)
+                 ok       (DQC:ok? primary alt factor))
            (if ok
              (setq label "{\\fArial|b1|i0;\\U+2713}"
                    layer DQC:PASS-LAYER)
              (setq label (strcat "{\\fArial|b1|i0;\\U+2717} "
                                  pfx (DQC:fmt primary in-dp)
-                                 "\" [" (DQC:fmt alt mm-dp)
-                                 "] exp " (DQC:fmt expected mm-dp) tol-str)
+                                 " [" (DQC:fmt alt mm-dp)
+                                 "] exp " (DQC:fmt expected mm-dp) " " unit-str tol-str)
                    layer DQC:FAIL-LAYER))
            (if txtpt (DQC:place-balloon txtpt txth dimang label layer))
            (list (if ok 'PASS 'FAIL) label primary alt expected raw))
         )
+        )) ; close TAPER progn and if
       ))
     )
   )
@@ -777,113 +798,11 @@
 
 
 ;;; ============================================================================
-;;;  PART 8 - DCL DIALOG
+;;;  PART 8 - MAIN COMMAND  C:DIMQC
 ;;; ============================================================================
 
-(defun DQC:write-dcl ( / path f)
-  (setq path (strcat (getvar "TEMPPREFIX") "dim_qc_v4.dcl"))
-  (setq f (open path "w"))
-  (write-line "dqc_settings : dialog {" f)
-  (write-line "  label = \"DIM QC v5.0  -  Tick / Cross Edition\";" f)
-  (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Conversion factor\";" f)
-  (write-line "    : row {" f)
-  (write-line "      : text  { label = \"1 inch  =  ? mm  (normally 25.4) :\"; }" f)
-  (write-line "      : edit_box { key = \"factor\"; width = 10; }" f)
-  (write-line "    }" f)
-  (write-line "  }" f)
-  (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Match tolerance (nominal value is QC-checked)\";" f)
-  (write-line "    : row {" f)
-  (write-line "      : text  { label = \"Relative tolerance  (%):        \"; }" f)
-  (write-line "      : edit_box { key = \"rel_tol\"; width = 8; }" f)
-  (write-line "    }" f)
-  (write-line "    : row {" f)
-  (write-line "      : text  { label = \"Absolute tolerance (mm):        \"; }" f)
-  (write-line "      : edit_box { key = \"abs_tol\"; width = 8; }" f)
-  (write-line "    }" f)
-  (write-line "  }" f)
-  (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Mark size  (0 = auto from dim style)\";" f)
-  (write-line "    : row {" f)
-  (write-line "      : text  { label = \"Text height  (0 = auto):        \"; }" f)
-  (write-line "      : edit_box { key = \"txth\"; width = 8; }" f)
-  (write-line "    }" f)
-  (write-line "    : row {" f)
-  (write-line "      : text  { label = \"Offset from dim text (0 = auto):\"; }" f)
-  (write-line "      : edit_box { key = \"offset\"; width = 8; }" f)
-  (write-line "    }" f)
-  (write-line "  }" f)
-  (write-line "  : boxed_column {" f)
-  (write-line "    label = \"Result key\";" f)
-  (write-line "    : text { label = \"  PASS:  green tick placed above dimension\"; }" f)
-  (write-line "    : text { label = \"  FAIL:  red cross + expected value shown\"; }" f)
-  (write-line "    : text { label = \"  EMPTY: red cross + [?] when mm missing\"; }" f)
-  (write-line "    : text { label = \"Freeze DIM_QC_PASS/FAIL to hide.  DIMQC-RESET removes.\"; }" f)
-  (write-line "  }" f)
-  (write-line "  : row {" f)
-  (write-line "    : button { key = \"run\";    label = \"Run QC\"; is_default = true; width = 24; }" f)
-  (write-line "    : button { key = \"cancel\"; label = \"Cancel\"; is_cancel = true; width = 12; }" f)
-  (write-line "  }" f)
-  (write-line "}" f)
-  (write-line "" f)
-  (write-line "dqc_results : dialog {" f)
-  (write-line "  label = \"DIM QC v5.0  -  Results\";" f)
-  (write-line "  : text { key = \"sum_line\"; label = \" \"; }" f)
-  (write-line "  : list_box {" f)
-  (write-line "    key        = \"res_list\";" f)
-  (write-line "    label      = \"All dual-unit dimensions checked:\";" f)
-  (write-line "    height     = 22;" f)
-  (write-line "    width      = 72;" f)
-  (write-line "    multiple_select = false;" f)
-  (write-line "  }" f)
-  (write-line "  : text { label = \"Green ticks (PASS) and red marks (FAIL) placed near dimensions.\"; }" f)
-  (write-line "  : text { label = \"Freeze DIM_QC_PASS / DIM_QC_FAIL to hide.  DIMQC-RESET to remove.\"; }" f)
-  (write-line "  ok_cancel;" f)
-  (write-line "}" f)
-  (close f)
-  path)
-
-
-;;; ============================================================================
-;;;  PART 9 - MAIN COMMAND  C:DIMQC
-;;; ============================================================================
-
-(defun C:DIMQC ( / dcl-path dcl-id action doc ss len i ename res
-                   total pass fail skip lines sumstr
-                   f-str r-str a-str h-str o-str)
-
+(defun C:DIMQC ( / doc ss len i ename res total pass fail skip sumstr)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
-  (setq dcl-path (DQC:write-dcl))
-  (setq dcl-id   (load_dialog dcl-path))
-  (if (< dcl-id 0) (progn (alert "Cannot load DCL file.") (exit)))
-  (if (not (new_dialog "dqc_settings" dcl-id))
-    (progn (unload_dialog dcl-id) (alert "Cannot open settings dialog.") (exit)))
-
-  (set_tile "factor"  (rtos DQC:MM/IN 2 4))
-  (set_tile "rel_tol" (rtos (* DQC:REL-TOL 100.0) 2 1))
-  (set_tile "abs_tol" (rtos DQC:ABS-TOL 2 3))
-  (set_tile "txth"    (if (and DQC:TXT-H   (> DQC:TXT-H   0)) (rtos DQC:TXT-H   2 3) "0"))
-  (set_tile "offset"  (if (and DQC:OFFSET  (> DQC:OFFSET  0)) (rtos DQC:OFFSET  2 3) "0"))
-
-  (setq action "cancel")
-  (action_tile "run"    "(setq action \"run\")    (done_dialog 1)")
-  (action_tile "cancel" "(setq action \"cancel\") (done_dialog 0)")
-  (start_dialog)
-
-  (setq f-str (get_tile "factor")  r-str (get_tile "rel_tol")
-        a-str (get_tile "abs_tol") h-str (get_tile "txth")
-        o-str (get_tile "offset"))
-  (unload_dialog dcl-id)
-
-  (if (= action "cancel") (progn (princ "\n Cancelled.\n") (princ) (exit)))
-
-  (if (and f-str (> (strlen f-str) 0)) (setq DQC:MM/IN   (atof f-str)))
-  (if (and r-str (> (strlen r-str) 0)) (setq DQC:REL-TOL (/ (atof r-str) 100.0)))
-  (if (and a-str (> (strlen a-str) 0)) (setq DQC:ABS-TOL (atof a-str)))
-  (setq DQC:TXT-H  (if (and h-str (> (atof h-str) 0)) (atof h-str) nil))
-  (setq DQC:OFFSET (if (and o-str (> (atof o-str) 0)) (atof o-str) nil))
-
   (DQC:ensure-layer DQC:PASS-LAYER DQC:PASS-COLOR doc)
   (DQC:ensure-layer DQC:FAIL-LAYER DQC:FAIL-COLOR doc)
   (DQC:erase-balloons doc)
@@ -891,52 +810,23 @@
   (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
   (if (null ss) (progn (alert "No dimension entities found.") (princ) (exit)))
 
-  (setq len (sslength ss) total 0 pass 0 fail 0 skip 0 lines (list))
+  (setq len (sslength ss) total 0 pass 0 fail 0 skip 0)
   (setq i 0)
   (while (< i len)
     (setq ename (ssname ss i)
           res   (DQC:process ename doc)
           total (1+ total))
     (cond
-      ((= (car res) 'PASS)
-       (setq pass (1+ pass))
-       (setq lines (append lines
-         (list (strcat "PASS  |  "
-                (if (nth 2 res) (strcat (rtos (nth 2 res) 2 4) "\"") "?")
-                "  ->  "
-                (if (nth 3 res) (rtos (nth 3 res) 2 3) "?") " mm"
-                "  (exp " (if (nth 4 res) (rtos (nth 4 res) 2 3) "?") " mm)")))))
-      ((= (car res) 'FAIL)
-       (setq fail (1+ fail))
-       (setq lines (append lines
-         (list (strcat "FAIL  |  "
-                (if (nth 2 res) (strcat (rtos (nth 2 res) 2 4) "\"") "?")
-                "  ->  "
-                (if (null (nth 3 res)) "[ ] EMPTY"
-                  (strcat (rtos (nth 3 res) 2 3) " mm"))
-                "  (exp " (if (nth 4 res) (rtos (nth 4 res) 2 3) "?") " mm)"
-                (if (null (nth 3 res)) "  <- mm NOT ENTERED" "  <- MISMATCH"))))))
+      ((= (car res) 'PASS) (setq pass (1+ pass)))
+      ((= (car res) 'FAIL) (setq fail (1+ fail)))
       (T (setq skip (1+ skip))))
     (setq i (1+ i)))
 
   (vla-Regen doc acAllViewports)
-
   (setq sumstr (strcat "Checked: " (itoa (+ pass fail))
                        "   PASS: " (itoa pass)
                        "   FAIL: " (itoa fail)
                        "   Skipped: " (itoa skip)))
-
-  (setq dcl-id (load_dialog dcl-path))
-  (if (not (new_dialog "dqc_results" dcl-id))
-    (progn (unload_dialog dcl-id) (princ (strcat "\n" sumstr "\n")) (princ) (exit)))
-
-  (set_tile "sum_line" sumstr)
-  (start_list "res_list")
-  (mapcar 'add_list lines)
-  (end_list)
-  (start_dialog)
-  (unload_dialog dcl-id)
-
   (princ (strcat "\n " sumstr "\n"))
   (princ))
 
