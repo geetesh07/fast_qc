@@ -1,30 +1,24 @@
 ;;; =====================================================================
-;;; METRIC_CHECK.LSP  v2
-;;; Command : METRIC_CHECK
+;;; METRIC_CHECK.LSP  v5
+;;; Commands: METRIC_CHECK   -- run the check, draw pass/fail balloons
+;;;           METRIC_CLEAR   -- erase all QC balloons + layers
 ;;;
 ;;; With the metric drawing open, type METRIC_CHECK.
-;;; A file picker lets you select the inch source drawing.
-;;; The routine checks THREE kinds of content:
+;;; Pick the inch source drawing from the file dialog.
 ;;;
-;;;   1. Dimension entities  (AcDb*Dimension, angular excluded)
-;;;   2. TEXT entities       (AcDbText)
-;;;   3. MTEXT entities      (AcDbMText, formatting codes stripped)
+;;; PASS entities get a green  checkmark balloon  (layer MC_PASS)
+;;; FAIL entities get a red    X balloon showing   got X.XXmm  exp Y.YYmm
 ;;;
-;;; Conversion rule:  metric = inch x 25.4   (tolerance +/- 0.1 mm)
-;;;
-;;; For text/mtext the routine extracts every number from the string.
-;;; Numbers that contain a decimal point are treated as dimension
-;;; annotation values and checked against the 25.4 rule.
-;;; Plain integers (note numbers, counts, etc.) that are unchanged
-;;; between drawings are silently skipped to avoid false positives.
+;;; Conversion rule:  metric = inch x 25.4   tolerance +/- 0.1 mm
+;;; Angular dims are excluded.
+;;; Integers in text (note numbers, counts) are skipped.
 ;;; =====================================================================
 
 (vl-load-com)
 
 
 ;;; -------------------------------------------------------------------
-;;; mc:is-digit
-;;; Returns T if single character C is an ASCII digit 0-9.
+;;; mc:is-digit  --  T if character C is ASCII 0-9
 ;;; -------------------------------------------------------------------
 (defun mc:is-digit (c)
   (and (>= (ascii c) 48) (<= (ascii c) 57))
@@ -32,8 +26,7 @@
 
 
 ;;; -------------------------------------------------------------------
-;;; mc:fmt
-;;; Format real number VAL to PREC decimal places as a string.
+;;; mc:fmt  --  format real VAL to PREC decimal places
 ;;; -------------------------------------------------------------------
 (defun mc:fmt (val prec /)
   (rtos val 2 prec)
@@ -41,26 +34,9 @@
 
 
 ;;; -------------------------------------------------------------------
-;;; mc:dashes
-;;; Return a string containing N dash characters.
-;;; -------------------------------------------------------------------
-(defun mc:dashes (n / s)
-  (setq s "")
-  (repeat n
-    (setq s (strcat s "-")))
-  s
-)
-
-
-;;; -------------------------------------------------------------------
 ;;; mc:strip-mtext
-;;; Remove AutoCAD MTEXT formatting codes from string S and return
-;;; the plain readable content.
-;;;
-;;; Handles:
-;;;   {\Hx.x;text}  {\fFont|...;text}  {\Cx;text}  -- format blocks
-;;;   \P \~ \N                                       -- paragraph/space
-;;;   %%c  %%d  %%p                                  -- special symbols
+;;; State-machine stripper for raw MTEXT strings.
+;;; Removes {\format;...} blocks, \P \~ escapes, %%c %%d %%p symbols.
 ;;; -------------------------------------------------------------------
 (defun mc:strip-mtext (s / res i len c nc depth skipSemi)
   (setq res      ""
@@ -71,26 +47,21 @@
   (while (<= i len)
     (setq c (substr s i 1))
     (cond
-      ;;-- Opening brace: if next char is \ it starts a format block
       ((= c "{")
        (setq depth (1+ depth))
        (if (and (< i len) (= (substr s (1+ i) 1) "\\"))
          (setq skipSemi T))
       )
-      ;;-- Closing brace: drop depth, clear any lingering skipSemi
       ((= c "}")
        (if (> depth 0) (setq depth (- depth 1)))
        (setq skipSemi nil)
       )
-      ;;-- Inside format header: skip everything until semicolon
       ((and skipSemi (not (= c ";")))
        nil
       )
-      ;;-- Semicolon ends the format header; content follows
       ((and skipSemi (= c ";"))
        (setq skipSemi nil)
       )
-      ;;-- Backslash escape sequence
       ((= c "\\")
        (if (<= (1+ i) len)
          (progn
@@ -101,17 +72,14 @@
          )
        )
       )
-      ;;-- %% special symbol (%%c %%d %%p): skip 3 chars total
-      ;;   After this cond arm the main loop adds 1 more, landing +3.
+      ;;-- %%x special symbols: skip 3 chars total
+      ;;   Loop adds 1 more at end, so +2 here lands +3.
       ((and (= c "%")
             (<= (1+ i) len)
             (= (substr s (1+ i) 1) "%"))
        (setq i (+ i 2))
       )
-      ;;-- Normal character: keep it
-      (T
-       (setq res (strcat res c))
-      )
+      (T (setq res (strcat res c)))
     )
     (setq i (1+ i))
   )
@@ -121,12 +89,9 @@
 
 ;;; -------------------------------------------------------------------
 ;;; mc:extract-numbers
-;;; Parse string STR and return a list of  (numericValue  isDecimal)
-;;; pairs in left-to-right order.
-;;;
-;;; isDecimal is T when the token contained a "." (i.e. it looks like
-;;; a dimension annotation such as .20 or 1.500).
-;;; Plain integers like 3 or 42 return isDecimal = nil.
+;;; Parse STR, return list of  (numericValue isDecimal)  pairs.
+;;; isDecimal = T when the token contained "."
+;;; Pure integers return isDecimal = nil.
 ;;; -------------------------------------------------------------------
 (defun mc:extract-numbers (str / result i len c numStr inNum hadDot)
   (setq result nil
@@ -138,21 +103,17 @@
   (while (<= i len)
     (setq c (substr str i 1))
     (cond
-      ;;-- Digit: accumulate
       ((mc:is-digit c)
        (setq numStr (strcat numStr c)
              inNum  T)
       )
-      ;;-- Decimal point
       ((= c ".")
        (cond
-         ;;- Already have a decimal: flush current number and reset
          (hadDot
           (if (and inNum (> (strlen numStr) 0))
             (setq result (cons (list (atof numStr) T) result)))
           (setq numStr "" inNum nil hadDot nil)
          )
-         ;;- Can extend or start a decimal number
          ((or inNum
               (and (<= (1+ i) len)
                    (mc:is-digit (substr str (1+ i) 1))))
@@ -160,7 +121,6 @@
                 hadDot T
                 inNum  T)
          )
-         ;;- Stray dot: flush any integer that was building
          (T
           (if (and inNum (> (strlen numStr) 0))
             (setq result (cons (list (atof numStr) nil) result)))
@@ -168,7 +128,6 @@
          )
        )
       )
-      ;;-- Any other character: flush the number we were building
       (T
        (if (and inNum (> (strlen numStr) 0))
          (setq result (cons (list (atof numStr) hadDot) result)))
@@ -177,7 +136,6 @@
     )
     (setq i (1+ i))
   )
-  ;;-- Flush the last number if the string ended while building one
   (if (and inNum (> (strlen numStr) 0))
     (setq result (cons (list (atof numStr) hadDot) result)))
   (reverse result)
@@ -185,9 +143,7 @@
 
 
 ;;; -------------------------------------------------------------------
-;;; mc:linear-dim-p
-;;; Returns T for linear/radial dimension entity names.
-;;; Excludes angular dimension types.
+;;; mc:linear-dim-p  --  T for linear/radial dims, nil for angular
 ;;; -------------------------------------------------------------------
 (defun mc:linear-dim-p (oname)
   (and (wcmatch oname "*Dimension*")
@@ -197,9 +153,8 @@
 
 ;;; -------------------------------------------------------------------
 ;;; mc:get-dims
-;;; Walk ModelSpace of DOC and collect all qualifying dimension values.
+;;; Collect dimension entities from DOC model space.
 ;;; Returns list of  (measurement (x y))
-;;; Bad entities are caught and skipped.
 ;;; -------------------------------------------------------------------
 (defun mc:get-dims (doc / ms cnt i obj oname measRes posRes pos result)
   (setq result nil
@@ -240,8 +195,7 @@
 
 ;;; -------------------------------------------------------------------
 ;;; mc:get-texts
-;;; Walk ModelSpace of DOC and collect TEXT and MTEXT content.
-;;; MTEXT formatting codes are stripped before storing.
+;;; Collect TEXT and MTEXT entities from DOC model space.
 ;;; Returns list of  (plainString (x y))
 ;;; -------------------------------------------------------------------
 (defun mc:get-texts (doc / ms cnt i obj oname txtRes posRes str pos result)
@@ -253,14 +207,12 @@
     (setq obj   (vla-item ms i)
           oname (vla-get-ObjectName obj))
     (cond
-      ;;-- Plain TEXT entity
       ((wcmatch oname "AcDbText")
-       (setq txtRes (vl-catch-all-apply 'vla-get-TextString    (list obj)))
+       (setq txtRes (vl-catch-all-apply 'vla-get-TextString     (list obj)))
        (setq posRes (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
        (if (and (not (vl-catch-all-error-p txtRes))
                 (not (vl-catch-all-error-p posRes)))
          (progn
-           (setq str txtRes)
            (setq pos
              (vl-catch-all-apply 'vlax-safearray->list
                (list (vlax-variant-value posRes))))
@@ -268,20 +220,18 @@
                     (listp pos)
                     (>= (length pos) 2))
              (setq result
-               (cons (list str (list (car pos) (cadr pos)))
+               (cons (list txtRes (list (car pos) (cadr pos)))
                      result))
            )
          )
        )
       )
-      ;;-- MTEXT entity: strip formatting first
       ((wcmatch oname "AcDbMText")
-       (setq txtRes (vl-catch-all-apply 'vla-get-TextString    (list obj)))
+       (setq txtRes (vl-catch-all-apply 'vla-get-TextString     (list obj)))
        (setq posRes (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
        (if (and (not (vl-catch-all-error-p txtRes))
                 (not (vl-catch-all-error-p posRes)))
          (progn
-           (setq str (mc:strip-mtext txtRes))
            (setq pos
              (vl-catch-all-apply 'vlax-safearray->list
                (list (vlax-variant-value posRes))))
@@ -289,7 +239,8 @@
                     (listp pos)
                     (>= (length pos) 2))
              (setq result
-               (cons (list str (list (car pos) (cadr pos)))
+               (cons (list (mc:strip-mtext txtRes)
+                           (list (car pos) (cadr pos)))
                      result))
            )
          )
@@ -304,20 +255,16 @@
 
 ;;; -------------------------------------------------------------------
 ;;; mc:sort-by-pos
-;;; Sort a list whose elements are  (anything (x y))
-;;; by X coordinate ascending, then Y ascending on ties.
-;;; Works for both dimension lists and text lists.
+;;; Sort  (anything (x y))  lists by X then Y.
 ;;; -------------------------------------------------------------------
 (defun mc:sort-by-pos (lst /)
   (vl-sort lst
     (function
       (lambda (a b)
         (cond
-          ((< (caadr a) (caadr b))
-           T)
+          ((< (caadr a) (caadr b)) T)
           ((and (equal (caadr a) (caadr b) 0.01)
-                (< (cadadr a) (cadadr b)))
-           T)
+                (< (cadadr a) (cadadr b))) T)
           (T nil)
         )
       )
@@ -326,36 +273,158 @@
 )
 
 
+;;; -------------------------------------------------------------------
+;;; mc:balloon-height
+;;; Return a sensible MTEXT height for QC balloons.
+;;; Based on DIMTXT x DIMSCALE so it scales with the drawing.
+;;; -------------------------------------------------------------------
+(defun mc:balloon-height (/ dtxt dscl sz)
+  (setq dtxt (getvar "DIMTXT")
+        dscl (getvar "DIMSCALE")
+        sz   (* (max dtxt 0.05) (max dscl 1.0) 0.85))
+  (max sz 0.5)
+)
+
+
+;;; -------------------------------------------------------------------
+;;; mc:ensure-layer
+;;; Create layer LNAME in DOC with COLOR if it does not exist.
+;;; If it already exists, just confirm the color.
+;;; Uses vl-catch-all-apply so a missing layer is handled cleanly.
+;;; -------------------------------------------------------------------
+(defun mc:ensure-layer (doc lname color / layers layerRes addRes)
+  (setq layers   (vla-get-Layers doc)
+        layerRes (vl-catch-all-apply 'vla-item (list layers lname)))
+  (if (vl-catch-all-error-p layerRes)
+    ;;-- Layer does not exist: create it
+    (progn
+      (setq addRes (vl-catch-all-apply 'vla-add (list layers lname)))
+      (if (not (vl-catch-all-error-p addRes))
+        (vla-put-Color addRes color))
+    )
+    ;;-- Layer exists: just update color
+    (vla-put-Color layerRes color)
+  )
+)
+
+
+;;; -------------------------------------------------------------------
+;;; mc:delete-layer
+;;; Remove layer LNAME from the current drawing.
+;;; Tries vla-delete first; falls back to the _-PURGE command.
+;;; Safely switches off LNAME as current layer before deleting.
+;;; -------------------------------------------------------------------
+(defun mc:delete-layer (lname / doc layers layerRes delRes)
+  (setq doc      (vla-get-ActiveDocument (vlax-get-acad-object))
+        layers   (vla-get-Layers doc)
+        layerRes (vl-catch-all-apply 'vla-item (list layers lname)))
+  (if (not (vl-catch-all-error-p layerRes))
+    (progn
+      ;;-- Never delete the current layer
+      (if (= (strcase (getvar "CLAYER")) (strcase lname))
+        (setvar "CLAYER" "0"))
+      ;;-- Try VLA delete
+      (setq delRes (vl-catch-all-apply 'vla-delete (list layerRes)))
+      ;;-- If VLA delete failed, try the PURGE command as fallback
+      (if (vl-catch-all-error-p delRes)
+        (vl-catch-all-apply 'command
+          (list "._-PURGE" "_La" lname "_No"))
+      )
+    )
+  )
+)
+
+
+;;; -------------------------------------------------------------------
+;;; mc:clear-qc-layers
+;;; Delete all entities on MC_PASS and MC_ERRORS, then delete both
+;;; layers.  Safe to call when the layers do not yet exist.
+;;; -------------------------------------------------------------------
+(defun mc:clear-qc-layers (/ ss i lname)
+  (foreach lname (list "MC_PASS" "MC_ERRORS")
+    ;;-- Purge entities on this layer
+    (setq ss (ssget "X" (list (cons 8 lname))))
+    (if ss
+      (progn
+        (setq i 0)
+        (repeat (sslength ss)
+          (entdel (ssname ss i))
+          (setq i (1+ i))
+        )
+      )
+    )
+    ;;-- Delete the layer itself
+    (mc:delete-layer lname)
+  )
+)
+
+
+;;; -------------------------------------------------------------------
+;;; mc:place-balloon
+;;; Place an MTEXT balloon just above position (PX PY).
+;;; BH      = balloon text height
+;;; ISPASS  = T for green checkmark,  nil for red fail marker
+;;; BODY    = detail string shown after the X on fail balloons
+;;;           (ignored for pass)
+;;;
+;;; Uses entmake (same technique as dim_qc_v16) for reliability.
+;;; PASS layer: MC_PASS  color 3 (green)
+;;; FAIL layer: MC_ERRORS  color 1 (red)
+;;; -------------------------------------------------------------------
+(defun mc:place-balloon (px py bh isPass body / ins label layer color bw ed)
+  ;;-- Offset the balloon slightly above the entity position
+  (setq ins (list px (+ py (* bh 0.75)) 0.0))
+
+  ;;-- Colour only changes, body always shows the three values
+  (if isPass
+    (setq layer "MC_PASS"   color 3)
+    (setq layer "MC_ERRORS" color 1)
+  )
+  (setq label (strcat "{\\fArial|b1|i0;" body "}"))
+
+  ;;-- Width: proportional to content, minimum 3x height
+  (setq bw (max (* (strlen label) bh 0.55) (* bh 3.0)))
+
+  (setq ed
+    (list (cons 0   "MTEXT")
+          (cons 100 "AcDbEntity")
+          (cons 8   layer)
+          (cons 62  color)
+          (cons 100 "AcDbMText")
+          (cons 10  ins)
+          (cons 40  bh)
+          (cons 41  bw)
+          (cons 71  1)
+          (cons 72  1)
+          (cons 1   label)))
+  (vl-catch-all-apply 'entmake (list ed))
+)
+
+
 ;;; ===================================================================
-;;; c:metric_check  --  the AutoCAD command
+;;; c:metric_check  --  main command
 ;;; ===================================================================
 (defun c:metric_check
-    (/ acadObj metricDoc inchFile openRes inchDoc
-       ;;-- dimension vars
+    (/ acadObj metricDoc metricMs inchFile openRes inchDoc
        metricDims inchDims mDimLen iDimLen dimN
-       ;;-- text vars
        metricTexts inchTexts mTxtLen iTxtLen txtN
-       ;;-- shared loop vars
        i j iVal mVal expected diff tolerance
-       ;;-- text-specific loop vars
        iEntry mEntry iStr mStr iNums mNums iNLen
        iNumPair mNumPair iNum mNum isDecimal
-       ;;-- error accumulators
-       dimErrors txtErrors errLine
-       dimPass dimFail txtPass txtFail
-       ;;-- report
-       report)
+       dimMarkers txtMarkers txtBody anyFail
+       errPos errLine balloonH errIdx
+       dimPass dimFail txtPass txtFail)
 
   (vl-load-com)
 
   ;;----------------------------------------------------------------
-  ;; 1. Store the currently active (metric) document reference first
+  ;; 1. Store metric document reference
   ;;----------------------------------------------------------------
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj))
 
   ;;----------------------------------------------------------------
-  ;; 2. Read all data from metric drawing BEFORE opening anything else
+  ;; 2. Read metric drawing data FIRST (active doc is still metric)
   ;;----------------------------------------------------------------
   (princ "\nReading metric drawing...")
   (setq metricDims  (mc:get-dims  metricDoc))
@@ -363,15 +432,15 @@
   (princ
     (strcat " "
             (itoa (length metricDims))  " dim(s), "
-            (itoa (length metricTexts)) " text/mtext entity(s) found."))
+            (itoa (length metricTexts)) " text/mtext found."))
 
   ;;----------------------------------------------------------------
-  ;; 3. Prompt the user to pick the inch source drawing
+  ;; 3. File picker for inch source drawing
   ;;----------------------------------------------------------------
   (setq inchFile (getfiled "Select Inch Source Drawing" "" "dwg" 4))
   (if (not inchFile)
     (progn
-      (princ "\nmetric_check: Cancelled by user.")
+      (princ "\nmetric_check: Cancelled.")
       (princ)
       (exit)
     )
@@ -387,8 +456,8 @@
 
   (if (vl-catch-all-error-p openRes)
     (progn
-      (alert
-        (strcat "ERROR: Could not open the file.\n"
+      (princ
+        (strcat "\nERROR opening file: "
                 (vl-catch-all-error-message openRes)))
       (princ)
       (exit)
@@ -397,7 +466,7 @@
   (setq inchDoc openRes)
 
   ;;----------------------------------------------------------------
-  ;; 5. Read all data from the inch drawing
+  ;; 5. Read inch drawing data
   ;;----------------------------------------------------------------
   (princ "\nReading inch drawing...")
   (setq inchDims  (mc:get-dims  inchDoc))
@@ -405,16 +474,21 @@
   (princ
     (strcat " "
             (itoa (length inchDims))  " dim(s), "
-            (itoa (length inchTexts)) " text/mtext entity(s) found."))
+            (itoa (length inchTexts)) " text/mtext found."))
 
   ;;----------------------------------------------------------------
   ;; 6. Close inch drawing and restore metric document
+  ;;   vla-close can throw on read-only files in some AutoCAD builds,
+  ;;   so catch the error and carry on regardless.
   ;;----------------------------------------------------------------
-  (vla-close inchDoc vlax-false)
+  (vl-catch-all-apply 'vla-close (list inchDoc vlax-false))
   (vla-Activate metricDoc)
 
+  ;;-- Get metric model space after re-activation
+  (setq metricMs (vla-get-ModelSpace metricDoc))
+
   ;;----------------------------------------------------------------
-  ;; 7. Sort all four lists by XY position
+  ;; 7. Sort all lists by XY position
   ;;----------------------------------------------------------------
   (setq metricDims  (mc:sort-by-pos metricDims))
   (setq inchDims    (mc:sort-by-pos inchDims))
@@ -422,12 +496,13 @@
   (setq inchTexts   (mc:sort-by-pos inchTexts))
 
   ;;----------------------------------------------------------------
-  ;; 8. Initialise accumulators
+  ;; 8. Initialise error accumulators
+  ;;   Each error entry: (description (x y))
   ;;----------------------------------------------------------------
   (setq tolerance 0.1
-        dimErrors nil   txtErrors nil
-        dimPass   0     dimFail   0
-        txtPass   0     txtFail   0)
+        dimMarkers nil  txtMarkers nil
+        dimPass    0    dimFail    0
+        txtPass    0    txtFail    0)
 
   ;;----------------------------------------------------------------
   ;; 9. DIMENSION CHECK
@@ -437,29 +512,30 @@
         dimN    (min mDimLen iDimLen)
         i       0)
 
-  (if (zerop dimN)
-    (princ "\nNo dimension entities to compare.")
+  (if (not (zerop dimN))
     (progn
       (princ (strcat "\nChecking " (itoa dimN) " dimension(s)..."))
       (repeat dimN
-        (setq iVal    (car (nth i inchDims))
-              mVal    (car (nth i metricDims))
+        (setq iVal    (car  (nth i inchDims))
+              errPos  (cadr (nth i metricDims))
+              mVal    (car  (nth i metricDims))
               expected (* iVal 25.4)
               diff    (abs (- mVal expected)))
         (if (> diff tolerance)
-          (progn
-            (setq dimFail (1+ dimFail))
-            (setq errLine
-              (strcat
-                "Dim #" (itoa (1+ i))
-                "   " (mc:fmt iVal 4) "\""
-                " x25.4 = " (mc:fmt expected 3) "mm"
-                "   found: " (mc:fmt mVal 3) "mm"
-                "   off by: " (mc:fmt diff 3) "mm  <--"))
-            (setq dimErrors (cons errLine dimErrors))
-          )
+          (setq dimFail (1+ dimFail))
           (setq dimPass (1+ dimPass))
         )
+        ;;-- Always add a balloon marker (green=pass, red=fail)
+        ;;   Body: {inch}"  {expected}mm  {actual}mm
+        (setq dimMarkers
+          (cons
+            (list
+              (<= diff tolerance)
+              (strcat (mc:fmt iVal 4) "\""
+                      "  " (mc:fmt expected 3) "mm"
+                      "  " (mc:fmt mVal 3) "mm")
+              errPos)
+            dimMarkers))
         (setq i (1+ i))
       )
     )
@@ -467,40 +543,41 @@
 
   ;;----------------------------------------------------------------
   ;; 10. TEXT / MTEXT CHECK
-  ;;
-  ;; For each matched text pair:
-  ;;   - Extract all numbers as (value isDecimal) from both strings
-  ;;   - If counts match, compare each pair:
-  ;;       metric  ~= inch x 25.4          -> PASS
-  ;;       metric  ~= inch  AND isDecimal  -> WARN (likely missed conversion)
-  ;;       metric  ~= inch  AND NOT isDecimal -> silent skip (note/count number)
-  ;;       neither condition               -> FAIL (wrong conversion)
   ;;----------------------------------------------------------------
   (setq mTxtLen (length metricTexts)
         iTxtLen (length inchTexts)
         txtN    (min mTxtLen iTxtLen)
         i       0)
 
-  (if (zerop txtN)
-    (princ "\nNo text entities to compare.")
+  (if (/= mTxtLen iTxtLen)
+    (princ
+      (strcat "\nWARNING: text count mismatch ("
+              (itoa iTxtLen) " inch vs "
+              (itoa mTxtLen) " metric) -- text check skipped."
+              "\n  Tip: make sure both drawings have the same text entities."))
+  )
+
+  (if (and (not (zerop txtN)) (= mTxtLen iTxtLen))
     (progn
       (princ (strcat "\nChecking " (itoa txtN) " text/mtext pair(s)..."))
       (repeat txtN
         (setq iEntry (nth i inchTexts)
               mEntry (nth i metricTexts)
-              iStr   (car iEntry)
-              mStr   (car mEntry)
+              iStr   (car  iEntry)
+              mStr   (car  mEntry)
+              errPos (cadr mEntry)
               iNums  (mc:extract-numbers iStr)
               mNums  (mc:extract-numbers mStr))
 
-        ;;-- Only compare pairs where both sides have numbers
-        ;;-- and the count of numbers is the same
-        (if (and iNums
-                 mNums
-                 (= (length iNums) (length mNums)))
+        ;;-- Walk through all number pairs for this text entity
+        ;;   Collect decimal pairs into one balloon body string.
+        ;;   Integers (note numbers, counts) are silently skipped.
+        (if (and iNums mNums (= (length iNums) (length mNums)))
           (progn
-            (setq iNLen (length iNums)
-                  j     0)
+            (setq iNLen    (length iNums)
+                  j        0
+                  txtBody  nil
+                  anyFail  nil)
             (repeat iNLen
               (setq iNumPair  (nth j iNums)
                     mNumPair  (nth j mNums)
@@ -509,42 +586,33 @@
                     mNum      (car  mNumPair)
                     expected  (* iNum 25.4)
                     diff      (abs (- mNum expected)))
-              (cond
-                ;;-- Correctly converted within tolerance
-                ((<= diff tolerance)
-                 (setq txtPass (1+ txtPass))
+              (if isDecimal
+                (progn
+                  ;;-- Track pass/fail counts
+                  (if (> diff tolerance)
+                    (setq anyFail T txtFail (1+ txtFail))
+                    (setq txtPass (1+ txtPass))
+                  )
+                  ;;-- Append this pair to the balloon body
+                  ;;   Format: {inch}"  {expected}mm  {actual}mm
+                  (setq txtBody
+                    (if txtBody
+                      (strcat txtBody "  |  "
+                              (mc:fmt iNum 4) "\""
+                              "  " (mc:fmt expected 3) "mm"
+                              "  " (mc:fmt mNum 3) "mm")
+                      (strcat (mc:fmt iNum 4) "\""
+                              "  " (mc:fmt expected 3) "mm"
+                              "  " (mc:fmt mNum 3) "mm")))
                 )
-                ;;-- Value is unchanged AND it was a decimal: likely
-                ;;   the conversion was simply forgotten
-                ((and isDecimal (equal mNum iNum 0.001))
-                 (setq txtFail (1+ txtFail))
-                 (setq errLine
-                   (strcat
-                     "Text #" (itoa (1+ i))
-                     "  value " (mc:fmt iNum 4)
-                     " is UNCHANGED  (expected "
-                     (mc:fmt expected 3) "mm)"
-                     "  [" iStr "]"))
-                 (setq txtErrors (cons errLine txtErrors))
-                )
-                ;;-- Decimal number but wrong converted value
-                (isDecimal
-                 (setq txtFail (1+ txtFail))
-                 (setq errLine
-                   (strcat
-                     "Text #" (itoa (1+ i))
-                     "   " (mc:fmt iNum 4) "\""
-                     " x25.4 = " (mc:fmt expected 3) "mm"
-                     "   found: " (mc:fmt mNum 3) "mm"
-                     "   off: " (mc:fmt diff 3) "mm"
-                     "  [" iStr "] -> [" mStr "]"))
-                 (setq txtErrors (cons errLine txtErrors))
-                )
-                ;;-- Integer that is unchanged: skip silently
-                ;;   (e.g. note numbers, quantity counts, item tags)
-                (T nil)
               )
               (setq j (1+ j))
+            )
+            ;;-- One marker per text entity (only if it had decimal numbers)
+            (if txtBody
+              (setq txtMarkers
+                (cons (list (not anyFail) txtBody errPos)
+                      txtMarkers))
             )
           )
         )
@@ -554,76 +622,96 @@
   )
 
   ;;----------------------------------------------------------------
-  ;; 11. Build the report string
+  ;; 11. QC layers -- clear old first, then create fresh
+  ;;     Order matters: clear BEFORE create avoids the
+  ;;     create-then-immediately-delete bug.
   ;;----------------------------------------------------------------
-  (setq report
-    (strcat "METRIC CHECK REPORT\n"
-            (mc:dashes 52) "\n\n"))
+  (princ "\nUpdating QC layers...")
+  (mc:clear-qc-layers)
+  (mc:ensure-layer metricDoc "MC_PASS"   3)
+  (mc:ensure-layer metricDoc "MC_ERRORS" 1)
 
-  ;;-- Dimensions section
-  (setq report (strcat report "[ DIMENSIONS ]\n"))
-  (if (/= mDimLen iDimLen)
-    (setq report
-      (strcat report
-        "  ! Count mismatch -- Inch: " (itoa iDimLen)
-        "  Metric: " (itoa mDimLen)
-        "  (comparing " (itoa dimN) ")\n"))
-  )
-  (if (zerop dimFail)
-    (setq report
-      (strcat report
-        "  PASS -- All " (itoa dimPass) " dimension(s) correct.\n"))
-    (progn
-      (setq report
-        (strcat report
-          "  FAIL -- " (itoa dimFail)
-          " error(s) in " (itoa dimN) " dimension(s):\n"))
-      (foreach e (reverse dimErrors)
-        (setq report (strcat report "  " e "\n")))
+  ;;----------------------------------------------------------------
+  ;; 12. Place one balloon per entity -- green=correct, red=wrong
+  ;;     Body always shows:  {inch}"  {expected}mm  {actual}mm
+  ;;----------------------------------------------------------------
+  (setq balloonH (mc:balloon-height)
+        errIdx   1)
+
+  ;;-- Dimension balloons
+  (foreach m (reverse dimMarkers)
+    (mc:place-balloon
+      (car  (caddr m))
+      (cadr (caddr m))
+      balloonH
+      (car m)
+      (cadr m))
+    (if (not (car m))
+      (progn
+        (princ (strcat "\n  [" (itoa errIdx) "] DIM FAIL: " (cadr m)))
+        (setq errIdx (1+ errIdx))
+      )
     )
   )
 
-  ;;-- Text section
-  (setq report (strcat report "\n[ TEXT / MTEXT ]\n"))
-  (if (/= mTxtLen iTxtLen)
-    (setq report
-      (strcat report
-        "  ! Count mismatch -- Inch: " (itoa iTxtLen)
-        "  Metric: " (itoa mTxtLen)
-        "  (comparing " (itoa txtN) ")\n"))
-  )
-  (if (zerop txtFail)
-    (setq report
-      (strcat report
-        "  PASS -- All " (itoa txtPass) " text value(s) correct.\n"))
-    (progn
-      (setq report
-        (strcat report
-          "  FAIL -- " (itoa txtFail)
-          " text error(s) found:\n"))
-      (foreach e (reverse txtErrors)
-        (setq report (strcat report "  " e "\n")))
+  ;;-- Text / MText balloons
+  (foreach m (reverse txtMarkers)
+    (mc:place-balloon
+      (car  (caddr m))
+      (cadr (caddr m))
+      balloonH
+      (car m)
+      (cadr m))
+    (if (not (car m))
+      (progn
+        (princ (strcat "\n  [" (itoa errIdx) "] TXT FAIL: " (cadr m)))
+        (setq errIdx (1+ errIdx))
+      )
     )
   )
 
-  ;;-- Footer
-  (setq report
-    (strcat report
-      "\n" (mc:dashes 52) "\n"
-      "Tolerance : +/- " (mc:fmt tolerance 2) " mm\n"
-      "Total errors : "
-      (itoa (+ dimFail txtFail))
-      "  (" (itoa dimFail) " dim + "
-      (itoa txtFail) " text)"))
+  (if (zerop (+ dimFail txtFail))
+    (princ "\nAll checks PASSED.")
+  )
+
+  ;;-- Regenerate so balloons appear  (integer 2 = acAllViewports)
+  (vla-Regen metricDoc 2)
 
   ;;----------------------------------------------------------------
-  ;; 12. Show report (popup + command line echo)
+  ;; 13. Summary
   ;;----------------------------------------------------------------
-  (alert report)
-  (princ "\n")
-  (princ report)
+  (princ
+    (strcat "\n"
+            "--------------------------------------------\n"
+            "METRIC CHECK DONE\n"
+            "  Dimensions : "
+            (itoa dimPass) " pass  " (itoa dimFail) " fail\n"
+            "  Text/MText : "
+            (itoa txtPass) " pass  " (itoa txtFail) " fail\n"
+            "  Total errors: " (itoa (+ dimFail txtFail)) "\n"
+            (if (> (+ dimFail txtFail) 0)
+              "  Green=correct  Red=wrong  (layers MC_PASS / MC_ERRORS)\n"
+              "  All conversions correct -- all balloons are green.\n")
+            "--------------------------------------------"))
   (princ)
 )
 
-(princ "\nMETRIC_CHECK.LSP v2 loaded. Type METRIC_CHECK to run.")
+
+;;; ===================================================================
+;;; c:metric_clear  --  erase all markers and delete the layer
+;;; ===================================================================
+(defun c:metric_clear (/)
+  (vl-load-com)
+  (mc:clear-qc-layers)
+  (vla-Regen
+    (vla-get-ActiveDocument (vlax-get-acad-object))
+    2)
+  (princ "\nMC_PASS and MC_ERRORS balloons and layers removed.")
+  (princ)
+)
+
+
+(princ "\nMETRIC_CHECK.LSP v5 loaded.")
+(princ "\n  METRIC_CHECK -- run check, green tick=pass  red X=fail+expected")
+(princ "\n  METRIC_CLEAR -- erase all QC balloons and layers")
 (princ)
