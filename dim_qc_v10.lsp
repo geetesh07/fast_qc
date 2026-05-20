@@ -646,31 +646,35 @@
 ;;; Returns the numeric value or nil if no scientific notation found
 (defun DQC:extract-scientific (s / su x-pos caret-pos base-str exp-str base exp sign)
   (setq su (strcase s))
-  ;; Look for "X 10^" or "X10^" pattern
-  (setq x-pos (vl-string-search "X1" su 0))
-  (if (null x-pos) nil
+  ;; Look for "X 10^" or "X10^"
+  (setq x-pos
+        (or (vl-string-search "X 10^" su)
+            (vl-string-search "X10^" su)))
+  (if (null x-pos)
+    nil
     (progn
-      ;; Find the caret
       (setq caret-pos (vl-string-search "^" su x-pos))
-      (if (null caret-pos) nil
+      (if (null caret-pos)
+        nil
         (progn
-          ;; Extract base (everything before X)
+          ;; Base = last number before X
           (setq base-str (substr s 1 x-pos))
-          ;; Get last number from base-str using trailing-number
           (setq base (DQC:trailing-number-in-seg base-str))
-          (if (null base) nil
+          (if (null base)
+            nil
             (progn
-              ;; Extract exponent (after ^)
-              (setq exp-str (substr s (+ caret-pos 2) 5))
+              ;; Exponent (allow + or -)
+              (setq exp-str (substr s (+ caret-pos 2) 6))
               (setq sign 1)
-              ;; Check for negative exponent
               (if (= (substr exp-str 1 1) "-")
                 (progn
                   (setq sign -1)
                   (setq exp-str (substr exp-str 2))))
               (setq exp (atof exp-str))
-              (if (zerop exp) nil
-                (* base (expt 10.0 (* sign exp)))))))))
+              (if (zerop exp)
+                nil
+                (* base (expt 10.0 (* sign exp)))))))))))
+
 
 ;;; Helper function: get trailing number from string
 (defun DQC:trailing-number-in-seg (s / i ns dot)

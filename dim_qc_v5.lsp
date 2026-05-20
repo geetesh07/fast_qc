@@ -835,28 +835,30 @@
 ;;;  PART 10 - DIMQC-RESET
 ;;; ============================================================================
 
-(defun DQC:erase-balloons (doc / ss len i)
-  (foreach lname (list DQC:PASS-LAYER DQC:FAIL-LAYER)
-    (setq ss (ssget "X" (list (cons 0 "MTEXT") (cons 8 lname))))
-    (if ss
-      (progn (setq len (sslength ss) i 0)
-             (while (< i len)
-               (vl-catch-all-apply 'entdel (list (ssname ss i)))
-               (setq i (1+ i))))))
-  (vl-catch-all-apply 'vla-Regen (list doc acAllViewports)))
-
 (defun C:DIMQC-RESET ( / doc n ss len i)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
   (setq n 0)
+
+  ;; 1. Erase all QC balloons
   (foreach lname (list DQC:PASS-LAYER DQC:FAIL-LAYER)
     (setq ss (ssget "X" (list (cons 0 "MTEXT") (cons 8 lname))))
     (if ss
-      (progn (setq len (sslength ss) i 0)
-             (while (< i len)
-               (vl-catch-all-apply 'entdel (list (ssname ss i)))
-               (setq n (1+ n) i (1+ i))))))
+      (progn
+        (setq len (sslength ss) i 0)
+        (while (< i len)
+          (vl-catch-all-apply 'entdel (list (ssname ss i)))
+          (setq n (1+ n) i (1+ i))))))
+
+  ;; 2. Delete QC layers themselves
+  (DQC:delete-layer doc DQC:PASS-LAYER)
+  (DQC:delete-layer doc DQC:FAIL-LAYER)
+
   (vla-Regen doc acAllViewports)
-  (princ (strcat "\n Removed " (itoa n) " mark(s).\n\n"))
+
+  (princ
+    (strcat
+      "\n Removed " (itoa n) " mark(s).\n"
+      " QC layers deleted.\n\n"))
   (princ))
 
 

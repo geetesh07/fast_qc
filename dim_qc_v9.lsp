@@ -672,13 +672,11 @@
               (if (zerop exp) nil
                 (* base (expt 10.0 (* sign exp)))))))))))
 
-;;; Helper function to get last number from end of string
-(defun DQC:trailing-number-in-seg (s / i ns dot ch)
+;;; Helper function: get trailing number from string
+(defun DQC:trailing-number-in-seg (s / i ns dot)
   (setq i (strlen s) ns "" dot nil)
-  ;; Skip trailing spaces
   (while (and (>= i 1) (= (substr s i 1) " "))
     (setq i (1- i)))
-  ;; Read number backwards
   (while (and (>= i 1)
               (or (wcmatch (substr s i 1) "#")
                   (and (= (substr s i 1) ".") (not dot))
@@ -686,9 +684,28 @@
     (if (= (substr s i 1) ".") (setq dot T))
     (setq ns (strcat (substr s i 1) ns))
     (setq i (1- i)))
-  (if (= (strlen ns) 0) nil (DQC:atof-safe ns)))
+  (if (= (strlen ns) 0) nil
+    (DQC:atof-safe ns)))
 
+;;; NEW: Detect numeric-only text entities (e.g. "9,317")
+;;; Used for Operating Conditions split-text matching
+(defun DQC:number-only-text (s / v)
+  (setq s (DQC:trim s))
+  (if (and (> (strlen s) 0)
+           (not (wcmatch (strcase s) "*[A-Z]*")))
+    (progn
+      (setq v (DQC:atof-safe s))
+      (if (> v 0.0) v nil))
+    nil))
 
+;;; Check if text contains any primary unit keyword (HP, IN-LB, etc.)
+(defun DQC:unit-text-has? (txt kw-list / su found)
+  (setq su (strcase txt) found nil)
+  (foreach kw kw-list
+    (if (and (not found)
+             (vl-string-search kw su))
+      (setq found T)))
+  found)
 ;;; ============================================================================
 ;;;  PART 9 - CROSS-ENTITY UNIT-PAIR MATCHER
 ;;;
@@ -827,6 +844,27 @@
             dp-p (nth 5 rule)
             dp-a (nth 6 rule))
       (setq hits (DQC:find-prim-hits txt kwl))
+;; ============================================================
+;; FALLBACK FOR OPERATING CONDITIONS:
+;; number in one text, unit + [alt] in another text
+;; ============================================================
+(if (and (null hits) (DQC:number-only-text txt))
+  (progn
+    (setq pv (DQC:number-only-text txt))
+    (foreach other-rec ent-info-list
+      (if (not (eq (nth 0 other-rec) ename))
+        (progn
+          (setq other-txt (nth 1 other-rec))
+          ;; does other text contain primary unit (HP / IN-LB)?
+          (if (DQC:unit-text-has? other-txt kwl)
+            (progn
+              ;; get alt value from that same text
+              (setq alt-val
+                    (DQC:find-alt-in-string other-txt altl 1))
+              (if alt-val
+                (setq hits
+                      (list
+                        (list pv 1 0 (car kwl))))))))))))
       (foreach hit hits
         (setq pv      (nth 0 hit)
               kw-pos  (nth 1 hit)
@@ -926,7 +964,7 @@
         (setq ename (ssname ss i))
         (if (not (DQC:on-qc-layer? ename))
           (progn
-            (setq txt (DQC:strip (DQC:get-text ename) 0.0 0.0))
+            (setq txt (DQC:get-text ename))
             (setq pt  (DQC:dim-textpt ename))
             (setq th  (DQC:dim-txth ename))
             (setq ent-info-list

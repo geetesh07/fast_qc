@@ -886,7 +886,7 @@
       ;; Evaluate
       (foreach hit hits
         (setq pv (car hit)
-              alt-val (or (DQC:find-alt-in-string txt altl 1) alt-val))
+        (setq alt-val (DQC:find-alt-in-string txt altl 1))
 
         (if alt-val
           (progn
