@@ -1,0 +1,1 @@
+Coding is in LSP. Will need to be carful with syntax. Parens can almost run the most perfect code.  Think like a professional autocad and coder and senior developer. Make sure code is logically sound
