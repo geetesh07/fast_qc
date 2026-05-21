@@ -1,629 +1,1147 @@
 ;;; =====================================================================
-;;; METRIC_CHECK.LSP  v2
-;;; Command : METRIC_CHECK
+;;; METRIC_CHECK.LSP  v15.0-CANONICAL-PRO
+;;; Commands: METRIC_CHECK / METRIC_CLEAR
 ;;;
-;;; With the metric drawing open, type METRIC_CHECK.
-;;; A file picker lets you select the inch source drawing.
-;;; The routine checks THREE kinds of content:
+;;; Professional build based on v14.2 + category patch, with these fixes:
 ;;;
-;;;   1. Dimension entities  (AcDb*Dimension, angular excluded)
-;;;   2. TEXT entities       (AcDbText)
-;;;   3. MTEXT entities      (AcDbMText, formatting codes stripped)
+;;;   1. Inch source DWG is read through ObjectDBX when available, so it does
+;;;      NOT open as a visible drawing tab/window. If ObjectDBX is unavailable,
+;;;      the code falls back to read-only vla-open and closes it automatically.
 ;;;
-;;; Conversion rule:  metric = inch x 25.4   (tolerance +/- 0.1 mm)
+;;;   2. Ignored block names/effective names:
+;;;        C, REVSYMB, REVC
+;;;      Attributes inside these blocks are never read or checked.
 ;;;
-;;; For text/mtext the routine extracts every number from the string.
-;;; Numbers that contain a decimal point are treated as dimension
-;;; annotation values and checked against the 25.4 rule.
-;;; Plain integers (note numbers, counts, etc.) that are unchanged
-;;; between drawings are silently skipped to avoid false positives.
+;;;   3. Text/attribute matching is category-safe:
+;;;        DIA/RAD/DIM/TOL are not cross-paired.
+;;;      Example fixed:
+;;;        .771 diameter will not match .03 FCF/tolerance.
+;;;
+;;;   4. Text/attribute result states are strict:
+;;;        FOUND + correct = green tick only
+;;;        FOUND + wrong   = white exp/got error
+;;;        NOT FOUND       = white ??
+;;;      A wrong found attribute will not become a separate inch ?? plus metric ??.
+;;;
+;;;   5. Random title/sheet/revision numbers are filtered out by:
+;;;        - ignored block names
+;;;        - dimension-like text rules
+;;;        - text category rules
+;;;
+;;;   6. Dimensions still use displayed override first, measurement fallback.
+;;;
+;;; Conversion:
+;;;   expected metric = inch displayed value * 25.4
+;;; Tolerance:
+;;;   +/- 0.1 mm
 ;;; =====================================================================
 
 (vl-load-com)
 
+;;; -------------------------------------------------------------------
+;;; Settings
+;;; -------------------------------------------------------------------
+(setq *mc-conv* 25.4)
+(setq *mc-tolerance* 0.1)
+(setq *mc-text-max-sane-diff* 2.0)
+(setq *mc-text-position-limit* 75.0)
+(setq *mc-max-inch-text-value* 1000.0)
+(setq *mc-max-metric-text-value* 25000.0)
+(setq *mc-position-weight-pass* 0.001)
+(setq *mc-position-weight-fail* 0.000001)
+(setq *mc-ignored-block-names* (list "C" "REVSYMB" "REVC"))
+(setq *mc-active-inch-doc* nil)
+(setq *mc-active-inch-dbx* nil)
 
 ;;; -------------------------------------------------------------------
-;;; mc:is-digit
-;;; Returns T if single character C is an ASCII digit 0-9.
+;;; Basic helpers
 ;;; -------------------------------------------------------------------
 (defun mc:is-digit (c)
-  (and (>= (ascii c) 48) (<= (ascii c) 57))
+  (and c (= (type c) 'STR) (= (strlen c) 1) (>= (ascii c) 48) (<= (ascii c) 57))
 )
 
-
-;;; -------------------------------------------------------------------
-;;; mc:fmt
-;;; Format real number VAL to PREC decimal places as a string.
-;;; -------------------------------------------------------------------
-(defun mc:fmt (val prec /)
-  (rtos val 2 prec)
+(defun mc:xy-p (p /)
+  (and (listp p) (>= (length p) 2) (numberp (car p)) (numberp (cadr p)))
 )
 
-
-;;; -------------------------------------------------------------------
-;;; mc:dashes
-;;; Return a string containing N dash characters.
-;;; -------------------------------------------------------------------
-(defun mc:dashes (n / s)
-  (setq s "")
-  (repeat n
-    (setq s (strcat s "-")))
+(defun mc:rtrim0 (s /)
+  (while (and (> (strlen s) 1) (= (substr s (strlen s) 1) "0") (vl-string-search "." s))
+    (setq s (substr s 1 (1- (strlen s))))
+  )
+  (if (and (> (strlen s) 1) (= (substr s (strlen s) 1) "."))
+    (setq s (substr s 1 (1- (strlen s))))
+  )
   s
 )
 
+(defun mc:fmt (v /)
+  (if (numberp v) (mc:rtrim0 (rtos v 2 4)) "??")
+)
+
+(defun mc:distance (p1 p2 / dx dy)
+  (if (and (mc:xy-p p1) (mc:xy-p p2))
+    (progn
+      (setq dx (- (car p1) (car p2))
+            dy (- (cadr p1) (cadr p2)))
+      (sqrt (+ (* dx dx) (* dy dy)))
+    )
+    1.0e99
+  )
+)
+
+(defun mc:scale-point (p sc /)
+  (if (and (mc:xy-p p) (numberp sc))
+    (list (* (car p) sc) (* (cadr p) sc))
+    nil
+  )
+)
+
+(defun mc:safearray-point (variantValue / res)
+  (setq res (vl-catch-all-apply 'vlax-safearray->list (list (vlax-variant-value variantValue))))
+  (if (and (not (vl-catch-all-error-p res)) (mc:xy-p res))
+    (list (car res) (cadr res))
+    nil
+  )
+)
+
+(defun mc:pos-distance-best (inchPos metricPos / scaled dScaled dRaw)
+  ;; Some DWGs are scaled by 25.4; some are not. Use whichever position relation is closer.
+  (if (and (mc:xy-p inchPos) (mc:xy-p metricPos))
+    (progn
+      (setq scaled (mc:scale-point inchPos *mc-conv*))
+      (setq dScaled (mc:distance scaled metricPos))
+      (setq dRaw (mc:distance inchPos metricPos))
+      (if (< dScaled dRaw) dScaled dRaw)
+    )
+    1.0e99
+  )
+)
+
+(defun mc:remove-first (item lst / result removed x)
+  (setq result nil removed nil)
+  (foreach x lst
+    (if (and (not removed) (equal x item 1e-8))
+      (setq removed T)
+      (setq result (cons x result))
+    )
+  )
+  (reverse result)
+)
+
+(defun mc:member-int (n lst / found x)
+  (setq found nil)
+  (foreach x lst (if (= x n) (setq found T)))
+  found
+)
+
+(defun mc:str-upper (s /)
+  (if (= (type s) 'STR) (strcase s) "")
+)
+
+(defun mc:normalize-control-codes (s / u)
+  ;; Keep cue matching mostly ASCII/control-code based. AutoCAD drawings can
+  ;; carry diameter/plus-minus as Unicode or as %% codes depending on source.
+  (setq u (mc:str-upper s))
+  (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
+  (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
+  (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
+  (while (vl-string-search "Ø" u) (setq u (vl-string-subst "%%C" "Ø" u)))
+  (while (vl-string-search "⌀" u) (setq u (vl-string-subst "%%C" "⌀" u)))
+  (while (vl-string-search "±" u) (setq u (vl-string-subst "+/-" "±" u)))
+  u
+)
+
+(defun mc:contains-any (s patterns / hit p u)
+  (setq hit nil u (mc:normalize-control-codes s))
+  (foreach p patterns
+    (if (vl-string-search p u) (setq hit T))
+  )
+  hit
+)
 
 ;;; -------------------------------------------------------------------
-;;; mc:strip-mtext
-;;; Remove AutoCAD MTEXT formatting codes from string S and return
-;;; the plain readable content.
-;;;
-;;; Handles:
-;;;   {\Hx.x;text}  {\fFont|...;text}  {\Cx;text}  -- format blocks
-;;;   \P \~ \N                                       -- paragraph/space
-;;;   %%c  %%d  %%p                                  -- special symbols
+;;; ObjectDBX: open inch DWG without visible window
+;;; -------------------------------------------------------------------
+(defun mc:create-objectdbx-doc (acadObj / versions prog dbx)
+  ;; Try modern ObjectDBX ProgIDs first, then generic.
+  (setq versions (list "ObjectDBX.AxDbDocument.25" "ObjectDBX.AxDbDocument.24" "ObjectDBX.AxDbDocument.23"
+                       "ObjectDBX.AxDbDocument.22" "ObjectDBX.AxDbDocument.21" "ObjectDBX.AxDbDocument.20"
+                       "ObjectDBX.AxDbDocument.19" "ObjectDBX.AxDbDocument.18" "ObjectDBX.AxDbDocument"))
+  (setq dbx nil)
+  (foreach prog versions
+    (if (not dbx)
+      (progn
+        (setq dbx (vl-catch-all-apply 'vla-GetInterfaceObject (list acadObj prog)))
+        (if (vl-catch-all-error-p dbx) (setq dbx nil))
+      )
+    )
+  )
+  dbx
+)
+
+(defun mc:open-inch-source-doc (acadObj inchFile / dbx openRes visibleRes)
+  ;; Returns (doc isDbx). isDbx=T means no visible drawing window was opened.
+  (setq dbx (mc:create-objectdbx-doc acadObj))
+  (if dbx
+    (progn
+      (setq openRes (vl-catch-all-apply 'vla-open (list dbx inchFile)))
+      (if (vl-catch-all-error-p openRes)
+        (progn
+          (vl-catch-all-apply 'vlax-release-object (list dbx))
+          ;; fallback: visible read-only open
+          (setq visibleRes (vl-catch-all-apply 'vla-open (list (vla-get-Documents acadObj) inchFile vlax-true)))
+          (if (vl-catch-all-error-p visibleRes) nil (list visibleRes nil))
+        )
+        (list dbx T)
+      )
+    )
+    (progn
+      (setq visibleRes (vl-catch-all-apply 'vla-open (list (vla-get-Documents acadObj) inchFile vlax-true)))
+      (if (vl-catch-all-error-p visibleRes) nil (list visibleRes nil))
+    )
+  )
+)
+
+(defun mc:close-inch-source-doc (doc isDbx /)
+  (if doc
+    (if isDbx
+      (vl-catch-all-apply 'vlax-release-object (list doc))
+      (vl-catch-all-apply 'vla-close (list doc vlax-false))
+    )
+  )
+)
+
+;;; -------------------------------------------------------------------
+;;; Block filters
+;;; -------------------------------------------------------------------
+(defun mc:block-name (blkRef / eRes nRes)
+  (setq eRes (vl-catch-all-apply 'vla-get-EffectiveName (list blkRef)))
+  (if (and (not (vl-catch-all-error-p eRes)) (= (type eRes) 'STR))
+    eRes
+    (progn
+      (setq nRes (vl-catch-all-apply 'vla-get-Name (list blkRef)))
+      (if (and (not (vl-catch-all-error-p nRes)) (= (type nRes) 'STR)) nRes "")
+    )
+  )
+)
+
+(defun mc:ignored-block-p (blkRef / bname hit x)
+  (setq bname (strcase (mc:block-name blkRef)) hit nil)
+  (foreach x *mc-ignored-block-names*
+    (if (= bname (strcase x)) (setq hit T))
+  )
+  hit
+)
+
+;;; -------------------------------------------------------------------
+;;; MTEXT cleanup and numeric extraction
 ;;; -------------------------------------------------------------------
 (defun mc:strip-mtext (s / res i len c nc depth skipSemi)
-  (setq res      ""
-        len      (strlen s)
-        i        1
-        depth    0
-        skipSemi nil)
+  (setq res "" len (strlen s) i 1 depth 0 skipSemi nil)
   (while (<= i len)
     (setq c (substr s i 1))
     (cond
-      ;;-- Opening brace: if next char is \ it starts a format block
       ((= c "{")
        (setq depth (1+ depth))
-       (if (and (< i len) (= (substr s (1+ i) 1) "\\"))
-         (setq skipSemi T))
+       (if (and (< i len) (= (substr s (1+ i) 1) "\\")) (setq skipSemi T))
       )
-      ;;-- Closing brace: drop depth, clear any lingering skipSemi
       ((= c "}")
        (if (> depth 0) (setq depth (- depth 1)))
        (setq skipSemi nil)
       )
-      ;;-- Inside format header: skip everything until semicolon
-      ((and skipSemi (not (= c ";")))
-       nil
-      )
-      ;;-- Semicolon ends the format header; content follows
-      ((and skipSemi (= c ";"))
-       (setq skipSemi nil)
-      )
-      ;;-- Backslash escape sequence
+      ((and skipSemi (not (= c ";"))) nil)
+      ((and skipSemi (= c ";")) (setq skipSemi nil))
       ((= c "\\")
        (if (<= (1+ i) len)
          (progn
            (setq nc (substr s (1+ i) 1))
-           (if (wcmatch nc "PpNn~")
-             (setq res (strcat res " ")))
+           (if (wcmatch nc "PpNn~") (setq res (strcat res " ")))
            (setq i (1+ i))
          )
        )
       )
-      ;;-- %% special symbol (%%c %%d %%p): skip 3 chars total
-      ;;   After this cond arm the main loop adds 1 more, landing +3.
-      ((and (= c "%")
-            (<= (1+ i) len)
-            (= (substr s (1+ i) 1) "%"))
+      ((and (= c "%") (<= (1+ i) len) (= (substr s (1+ i) 1) "%"))
+       ;; Skip %%c / %%d / %%p codes.
        (setq i (+ i 2))
       )
-      ;;-- Normal character: keep it
-      (T
-       (setq res (strcat res c))
-      )
+      (T (setq res (strcat res c)))
     )
     (setq i (1+ i))
   )
   res
 )
 
-
-;;; -------------------------------------------------------------------
-;;; mc:extract-numbers
-;;; Parse string STR and return a list of  (numericValue  isDecimal)
-;;; pairs in left-to-right order.
-;;;
-;;; isDecimal is T when the token contained a "." (i.e. it looks like
-;;; a dimension annotation such as .20 or 1.500).
-;;; Plain integers like 3 or 42 return isDecimal = nil.
-;;; -------------------------------------------------------------------
-(defun mc:extract-numbers (str / result i len c numStr inNum hadDot)
-  (setq result nil
-        len    (strlen str)
-        i      1
-        inNum  nil
-        numStr ""
-        hadDot nil)
+(defun mc:extract-number-pairs (str / result i len c token hadDot hadDigitAfterDot stopToken sign nextc)
+  ;; Returns (value isDecimal tokenString). Bare note tokens like 1. are ignored.
+  (setq result nil len (strlen str) i 1)
   (while (<= i len)
     (setq c (substr str i 1))
+    (setq sign "")
+    (if (and (or (= c "+") (= c "-"))
+             (< i len)
+             (or (mc:is-digit (substr str (1+ i) 1))
+                 (= (substr str (1+ i) 1) ".")))
+      (progn
+        (setq nextc (substr str (1+ i) 1))
+        ;; A sign immediately after a digit is usually tolerance syntax, not a
+        ;; separate signed conversion value.
+        (if (or (= i 1)
+                (not (mc:is-digit (substr str (1- i) 1))))
+          (progn
+            (setq sign c)
+            (setq i (1+ i))
+            (setq c nextc)
+          )
+        )
+      )
+    )
     (cond
-      ;;-- Digit: accumulate
       ((mc:is-digit c)
-       (setq numStr (strcat numStr c)
-             inNum  T)
-      )
-      ;;-- Decimal point
-      ((= c ".")
-       (cond
-         ;;- Already have a decimal: flush current number and reset
-         (hadDot
-          (if (and inNum (> (strlen numStr) 0))
-            (setq result (cons (list (atof numStr) T) result)))
-          (setq numStr "" inNum nil hadDot nil)
+       (setq token (strcat sign c) hadDot nil hadDigitAfterDot nil stopToken nil i (1+ i))
+       (while (and (<= i len) (not stopToken) (or (mc:is-digit (substr str i 1)) (= (substr str i 1) ".")))
+         (setq c (substr str i 1))
+         (cond
+           ((mc:is-digit c)
+            (setq token (strcat token c))
+            (if hadDot (setq hadDigitAfterDot T))
+           )
+           ((= c ".")
+            (if hadDot
+              (setq stopToken T)
+              (progn (setq token (strcat token c)) (setq hadDot T))
+            )
+           )
          )
-         ;;- Can extend or start a decimal number
-         ((or inNum
-              (and (<= (1+ i) len)
-                   (mc:is-digit (substr str (1+ i) 1))))
-          (setq numStr (strcat numStr c)
-                hadDot T
-                inNum  T)
-         )
-         ;;- Stray dot: flush any integer that was building
-         (T
-          (if (and inNum (> (strlen numStr) 0))
-            (setq result (cons (list (atof numStr) nil) result)))
-          (setq numStr "" inNum nil hadDot nil)
-         )
+         (if (not stopToken) (setq i (1+ i)))
        )
+       (if (not (and hadDot (not hadDigitAfterDot)))
+         (setq result (cons (list (atof token) hadDot token) result))
+       )
+       (setq i (1- i))
       )
-      ;;-- Any other character: flush the number we were building
-      (T
-       (if (and inNum (> (strlen numStr) 0))
-         (setq result (cons (list (atof numStr) hadDot) result)))
-       (setq numStr "" inNum nil hadDot nil)
+      ((and (= c ".") (< i len) (mc:is-digit (substr str (1+ i) 1)))
+       (setq token (strcat sign "0.") i (+ i 1))
+       (while (and (<= i len) (mc:is-digit (substr str i 1)))
+         (setq token (strcat token (substr str i 1)))
+         (setq i (1+ i))
+       )
+       (setq result (cons (list (atof token) T token) result))
+       (setq i (1- i))
       )
     )
     (setq i (1+ i))
   )
-  ;;-- Flush the last number if the string ended while building one
-  (if (and inNum (> (strlen numStr) 0))
-    (setq result (cons (list (atof numStr) hadDot) result)))
   (reverse result)
 )
 
+(defun mc:first-preferred-number (str / pairs p decimalVal intVal)
+  (setq pairs (mc:extract-number-pairs str) decimalVal nil intVal nil)
+  (foreach p pairs
+    (if (and (listp p) (numberp (car p)))
+      (cond
+        ((and (cadr p) (not decimalVal)) (setq decimalVal (car p)))
+        ((and (not (cadr p)) (not intVal)) (setq intVal (car p)))
+      )
+    )
+  )
+  (cond ((numberp decimalVal) decimalVal) ((numberp intVal) intVal) (T nil))
+)
+
+(defun mc:bad-titleblock-word-p (s /)
+  (mc:contains-any s
+    (list "SHEET" "REV" "DATE" "DRAWING" "DWG" "TITLE" "CAGE" "SCALE" "ZONE"
+          "APPRO" "CHECK" "DRAWN" "ORDER" "PART" "SERIAL" "S/N" "ITEM"
+          "QTY" "QUANTITY" "PROJECT" "CUSTOMER" "CONTRACT" "SIZE" "CODE"
+          "NO." "NUMBER" "MODEL" "MATERIAL" "FINISH"))
+)
+
+(defun mc:dim-cue-p (s / u)
+  (setq u (mc:normalize-control-codes (vl-string-trim " \t\r\n" s)))
+  (or (mc:contains-any u (list "%%C" " DIA" "DIAM" " R" "R." " R." "RAD" " THRU" "+/-"))
+      (= (substr u 1 1) "R"))
+)
+
+(defun mc:single-number-string-p (s / pairs stripped ok ch)
+  (setq stripped (vl-string-trim " \t\r\n()[]{}\"'" (mc:strip-mtext s)))
+  (setq pairs (mc:extract-number-pairs stripped))
+  (setq ok T)
+  (foreach ch (mapcar 'chr (vl-string->list stripped))
+    (if (not (or (mc:is-digit ch) (= ch ".") (= ch "+") (= ch "-") (= ch ",")))
+      (setq ok nil)
+    )
+  )
+  (and (= (length pairs) 1) ok)
+)
+
+(defun mc:only-dimlike-integer-p (s / u cleaned pairs allDigits rem ch)
+  (setq u (strcase (mc:strip-mtext s)))
+  (setq pairs (mc:extract-number-pairs u))
+  (if (and (= (length pairs) 1) (numberp (caar pairs)) (not (cadar pairs)))
+    (progn
+      (setq cleaned u)
+      (foreach rem (list "(" ")" "[" "]" "{" "}" "\"" "'" "+" "-" "R" "DIA" "DIAM" "DIAMETER" "Ø" "%%C" "⌀" " " "\t" "\r" "\n")
+        (setq cleaned (vl-string-subst "" rem cleaned))
+      )
+      (setq allDigits T)
+      (foreach ch (mapcar 'chr (vl-string->list cleaned))
+        (if (not (mc:is-digit ch)) (setq allDigits nil))
+      )
+      (and (> (strlen cleaned) 0) allDigits)
+    )
+    nil
+  )
+)
+
+(defun mc:number-sane-for-text-p (v isMetric / av)
+  (setq av (if (numberp v) (abs v) nil))
+  (and av (> av 0.0) (if isMetric (< av *mc-max-metric-text-value*) (< av *mc-max-inch-text-value*)))
+)
+
+(defun mc:extract-conversion-numbers-core (str isMetric / result pairs p val isDec token raw)
+  ;; Strict dimension-like extraction. This keeps title/sheet/revision numbers out.
+  (setq result nil raw (mc:strip-mtext str) pairs (mc:extract-number-pairs raw))
+  (foreach p pairs
+    (setq val (car p) isDec (cadr p) token (caddr p))
+    (if (and (mc:number-sane-for-text-p val isMetric)
+             (not (and (not (mc:dim-cue-p raw)) (mc:bad-titleblock-word-p raw))))
+      (cond
+        ((and isDec (= (substr token 1 2) "0.")) (setq result (cons val result)))
+        ((and isDec (or (mc:dim-cue-p raw) (mc:single-number-string-p raw))) (setq result (cons val result)))
+        ((and (not isDec) (mc:only-dimlike-integer-p raw)) (setq result (cons val result)))
+      )
+    )
+  )
+  (reverse result)
+)
+(defun mc:extract-conversion-numbers (str /) (mc:extract-conversion-numbers-core str nil))
+(defun mc:extract-conversion-numbers-metric (str /) (mc:extract-conversion-numbers-core str T))
 
 ;;; -------------------------------------------------------------------
-;;; mc:linear-dim-p
-;;; Returns T for linear/radial dimension entity names.
-;;; Excludes angular dimension types.
+;;; Text category classification - prevents DIA/TOL cross-matching
+;;; -------------------------------------------------------------------
+(defun mc:max-num (nums / m n)
+  (setq m nil)
+  (foreach n nums (if (numberp n) (if (or (not m) (> n m)) (setq m n))))
+  m
+)
+(defun mc:raw-upper (s /) (mc:normalize-control-codes (mc:strip-mtext s)))
+(defun mc:has-dia-cue-p (s / u)
+  (setq u (mc:raw-upper s))
+  (or (vl-string-search "%%C" u) (vl-string-search "DIA" u) (vl-string-search "DIAM" u))
+)
+(defun mc:has-radius-cue-p (s / u)
+  (setq u (vl-string-trim " \t\r\n" (mc:raw-upper s)))
+  (or (= (substr u 1 1) "R") (vl-string-search " R" u) (vl-string-search "RAD" u))
+)
+(defun mc:has-fcf-cue-p (s / u)
+  (setq u (mc:raw-upper s))
+  (or (vl-string-search " M" u) (vl-string-search " L" u) (vl-string-search " S" u)
+      (vl-string-search " A" u) (vl-string-search " B" u) (vl-string-search " C" u)
+      (vl-string-search "|" u))
+)
+(defun mc:text-kind (s isMetric / nums mx)
+  (setq nums (if isMetric (mc:extract-conversion-numbers-metric s) (mc:extract-conversion-numbers s)))
+  (setq mx (mc:max-num nums))
+  (cond
+    ((mc:has-dia-cue-p s) 'DIA)
+    ((mc:has-radius-cue-p s) 'RAD)
+    ((and mx (mc:has-fcf-cue-p s) (< mx 1.0)) 'TOL)
+    ((and mx (< mx 0.1)) 'TOL)
+    ((and mx (>= mx 0.1)) 'DIM)
+    (T 'OTHER)
+  )
+)
+(defun mc:same-text-kind-p (inchEntry metricEntry / ki km)
+  (setq ki (mc:text-kind (car inchEntry) nil))
+  (setq km (mc:text-kind (car metricEntry) T))
+  (= ki km)
+)
+
+;;; -------------------------------------------------------------------
+;;; Dimension collection
 ;;; -------------------------------------------------------------------
 (defun mc:linear-dim-p (oname)
-  (and (wcmatch oname "*Dimension*")
-       (not (wcmatch oname "*Angular*")))
+  (and (wcmatch oname "*Dimension*") (not (wcmatch oname "*Angular*")))
 )
-
-
-;;; -------------------------------------------------------------------
-;;; mc:get-dims
-;;; Walk ModelSpace of DOC and collect all qualifying dimension values.
-;;; Returns list of  (measurement (x y))
-;;; Bad entities are caught and skipped.
-;;; -------------------------------------------------------------------
-(defun mc:get-dims (doc / ms cnt i obj oname measRes posRes pos result)
-  (setq result nil
-        ms     (vla-get-ModelSpace doc)
-        cnt    (vla-get-Count ms)
-        i      0)
+(defun mc:get-dim-override-value (obj / txtRes txt stripped val)
+  (setq txtRes (vl-catch-all-apply 'vla-get-TextOverride (list obj)))
+  (if (vl-catch-all-error-p txtRes)
+    nil
+    (progn
+      (setq txt txtRes)
+      (if (or (not txt) (= txt "") (vl-string-search "<>" txt))
+        nil
+        (progn
+          (setq stripped (mc:strip-mtext txt))
+          (setq val (mc:first-preferred-number stripped))
+          (if (numberp val) val nil)
+        )
+      )
+    )
+  )
+)
+(defun mc:get-dim-value (obj / overrideVal measRes)
+  (setq overrideVal (mc:get-dim-override-value obj))
+  (if (numberp overrideVal)
+    overrideVal
+    (progn
+      (setq measRes (vl-catch-all-apply 'vla-get-Measurement (list obj)))
+      (if (and (not (vl-catch-all-error-p measRes)) (numberp measRes)) measRes nil)
+    )
+  )
+)
+(defun mc:dim-geometry-point (obj / p1Res p2Res p1 p2 txtRes txtPos)
+  (setq p1 nil p2 nil txtPos nil)
+  (setq p1Res (vl-catch-all-apply 'vla-get-ExtLine1Point (list obj)))
+  (setq p2Res (vl-catch-all-apply 'vla-get-ExtLine2Point (list obj)))
+  (if (and (not (vl-catch-all-error-p p1Res)) (not (vl-catch-all-error-p p2Res)))
+    (progn (setq p1 (mc:safearray-point p1Res)) (setq p2 (mc:safearray-point p2Res)))
+  )
+  (if (and p1 p2)
+    (list (/ (+ (car p1) (car p2)) 2.0) (/ (+ (cadr p1) (cadr p2)) 2.0))
+    (progn
+      (setq txtRes (vl-catch-all-apply 'vla-get-TextPosition (list obj)))
+      (if (not (vl-catch-all-error-p txtRes)) (setq txtPos (mc:safearray-point txtRes)))
+      txtPos
+    )
+  )
+)
+(defun mc:get-dims (doc / ms cnt i obj oname dimVal pos result)
+  (setq result nil ms (vla-get-ModelSpace doc) cnt (vla-get-Count ms) i 0)
   (while (< i cnt)
-    (setq obj   (vla-item ms i)
-          oname (vla-get-ObjectName obj))
+    (setq obj (vla-item ms i) oname (vla-get-ObjectName obj))
     (if (mc:linear-dim-p oname)
       (progn
-        (setq measRes
-          (vl-catch-all-apply 'vla-get-Measurement (list obj)))
-        (setq posRes
-          (vl-catch-all-apply 'vla-get-TextPosition (list obj)))
-        (if (and (not (vl-catch-all-error-p measRes))
-                 (not (vl-catch-all-error-p posRes)))
+        (setq dimVal (mc:get-dim-value obj))
+        (setq pos (mc:dim-geometry-point obj))
+        (if (and (numberp dimVal) (mc:xy-p pos))
+          (setq result (cons (list dimVal pos) result))
+        )
+      )
+    )
+    (setq i (1+ i))
+  )
+  result
+)
+
+;;; -------------------------------------------------------------------
+;;; Text / attribute collection
+;;; -------------------------------------------------------------------
+(defun mc:get-object-insertion-xy (obj / posRes pos)
+  (setq posRes (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
+  (if (vl-catch-all-error-p posRes)
+    nil
+    (progn
+      (setq pos (vl-catch-all-apply 'vlax-safearray->list (list (vlax-variant-value posRes))))
+      (if (and (not (vl-catch-all-error-p pos)) (mc:xy-p pos)) (list (car pos) (cadr pos)) nil)
+    )
+  )
+)
+(defun mc:add-textlike-object (obj result / oname txtRes pos txt)
+  (setq oname (vla-get-ObjectName obj))
+  (setq txtRes (vl-catch-all-apply 'vla-get-TextString (list obj)))
+  (setq pos (mc:get-object-insertion-xy obj))
+  (if (and (not (vl-catch-all-error-p txtRes)) (= (type txtRes) 'STR) (mc:xy-p pos))
+    (progn
+      (setq txt txtRes)
+      (if (wcmatch oname "AcDbMText") (setq txt (mc:strip-mtext txt)))
+      (cons (list txt pos) result)
+    )
+    result
+  )
+)
+(defun mc:add-block-attributes (blkRef result / hasRes attRes attList att)
+  (if (mc:ignored-block-p blkRef)
+    result
+    (progn
+      (setq hasRes (vl-catch-all-apply 'vla-get-HasAttributes (list blkRef)))
+      (if (and (not (vl-catch-all-error-p hasRes)) hasRes)
+        (progn
+          (setq attRes (vl-catch-all-apply 'vla-GetAttributes (list blkRef)))
+          (if (not (vl-catch-all-error-p attRes))
+            (progn
+              (setq attList (vl-catch-all-apply 'vlax-safearray->list (list (vlax-variant-value attRes))))
+              (if (and (not (vl-catch-all-error-p attList)) (listp attList))
+                (foreach att attList (setq result (mc:add-textlike-object att result)))
+              )
+            )
+          )
+        )
+      )
+      result
+    )
+  )
+)
+(defun mc:get-texts (doc / ms cnt i obj oname result)
+  (setq result nil ms (vla-get-ModelSpace doc) cnt (vla-get-Count ms) i 0)
+  (while (< i cnt)
+    (setq obj (vla-item ms i) oname (vla-get-ObjectName obj))
+    (cond
+      ((or (wcmatch oname "AcDbText") (wcmatch oname "AcDbMText") (wcmatch oname "AcDbAttribute") (wcmatch oname "AcDbAttributeDefinition"))
+       (setq result (mc:add-textlike-object obj result))
+      )
+      ((wcmatch oname "AcDbBlockReference")
+       (setq result (mc:add-block-attributes obj result))
+      )
+    )
+    (setq i (1+ i))
+  )
+  result
+)
+
+;;; -------------------------------------------------------------------
+;;; Matching helpers
+;;; -------------------------------------------------------------------
+(defun mc:find-best-dim-match (iEntry metricList / expected best bestScore bestVDiff bestPDist mEntry mVal vDiff pDist score)
+  (setq best nil bestScore nil bestVDiff nil bestPDist nil)
+  (if (and iEntry (numberp (car iEntry)))
+    (progn
+      (setq expected (* (abs (car iEntry)) *mc-conv*))
+      (foreach mEntry metricList
+        (setq mVal (car mEntry))
+        (if (numberp mVal)
           (progn
-            (setq pos
-              (vl-catch-all-apply 'vlax-safearray->list
-                (list (vlax-variant-value posRes))))
-            (if (and (not (vl-catch-all-error-p pos))
-                     (listp pos)
-                     (>= (length pos) 2))
-              (setq result
-                (cons (list measRes (list (car pos) (cadr pos)))
-                      result))
+            (setq vDiff (abs (- (abs mVal) expected)))
+            (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
+            (if (<= vDiff *mc-tolerance*)
+              (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
+              (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
+            )
+            (if (or (not bestScore) (< score bestScore))
+              (setq best mEntry bestScore score bestVDiff vDiff bestPDist pDist)
             )
           )
         )
       )
     )
-    (setq i (1+ i))
   )
-  result
+  (if best (list best bestVDiff bestPDist) nil)
 )
 
-
-;;; -------------------------------------------------------------------
-;;; mc:get-texts
-;;; Walk ModelSpace of DOC and collect TEXT and MTEXT content.
-;;; MTEXT formatting codes are stripped before storing.
-;;; Returns list of  (plainString (x y))
-;;; -------------------------------------------------------------------
-(defun mc:get-texts (doc / ms cnt i obj oname txtRes posRes str pos result)
-  (setq result nil
-        ms     (vla-get-ModelSpace doc)
-        cnt    (vla-get-Count ms)
-        i      0)
-  (while (< i cnt)
-    (setq obj   (vla-item ms i)
-          oname (vla-get-ObjectName obj))
-    (cond
-      ;;-- Plain TEXT entity
-      ((wcmatch oname "AcDbText")
-       (setq txtRes (vl-catch-all-apply 'vla-get-TextString    (list obj)))
-       (setq posRes (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
-       (if (and (not (vl-catch-all-error-p txtRes))
-                (not (vl-catch-all-error-p posRes)))
-         (progn
-           (setq str txtRes)
-           (setq pos
-             (vl-catch-all-apply 'vlax-safearray->list
-               (list (vlax-variant-value posRes))))
-           (if (and (not (vl-catch-all-error-p pos))
-                    (listp pos)
-                    (>= (length pos) 2))
-             (setq result
-               (cons (list str (list (car pos) (cadr pos)))
-                     result))
-           )
-         )
-       )
+(defun mc:global-best-number-pairs (inchNums metricNums / candidates iIdx mIdx iVal mVal expected diff sorted selected usedI usedM cand)
+  (setq candidates nil iIdx 0)
+  (foreach iVal inchNums
+    (setq mIdx 0)
+    (foreach mVal metricNums
+      (if (and (numberp iVal) (numberp mVal))
+        (progn
+          (setq expected (* (abs iVal) *mc-conv*))
+          (setq diff (abs (- (abs mVal) expected)))
+          (setq candidates (cons (list diff iIdx mIdx iVal mVal expected) candidates))
+        )
       )
-      ;;-- MTEXT entity: strip formatting first
-      ((wcmatch oname "AcDbMText")
-       (setq txtRes (vl-catch-all-apply 'vla-get-TextString    (list obj)))
-       (setq posRes (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
-       (if (and (not (vl-catch-all-error-p txtRes))
-                (not (vl-catch-all-error-p posRes)))
-         (progn
-           (setq str (mc:strip-mtext txtRes))
-           (setq pos
-             (vl-catch-all-apply 'vlax-safearray->list
-               (list (vlax-variant-value posRes))))
-           (if (and (not (vl-catch-all-error-p pos))
-                    (listp pos)
-                    (>= (length pos) 2))
-             (setq result
-               (cons (list str (list (car pos) (cadr pos)))
-                     result))
-           )
-         )
-       )
+      (setq mIdx (1+ mIdx))
+    )
+    (setq iIdx (1+ iIdx))
+  )
+  (setq sorted (vl-sort candidates '(lambda (a b) (< (car a) (car b)))))
+  (setq selected nil usedI nil usedM nil)
+  (foreach cand sorted
+    (if (and (not (mc:member-int (cadr cand) usedI)) (not (mc:member-int (caddr cand) usedM)))
+      (progn
+        (setq selected (cons (list (cadddr cand) (nth 4 cand) (nth 5 cand) (car cand)) selected))
+        (setq usedI (cons (cadr cand) usedI))
+        (setq usedM (cons (caddr cand) usedM))
       )
     )
-    (setq i (1+ i))
   )
-  result
+  (reverse selected)
 )
-
-
-;;; -------------------------------------------------------------------
-;;; mc:sort-by-pos
-;;; Sort a list whose elements are  (anything (x y))
-;;; by X coordinate ascending, then Y ascending on ties.
-;;; Works for both dimension lists and text lists.
-;;; -------------------------------------------------------------------
-(defun mc:sort-by-pos (lst /)
-  (vl-sort lst
-    (function
-      (lambda (a b)
-        (cond
-          ((< (caadr a) (caadr b))
-           T)
-          ((and (equal (caadr a) (caadr b) 0.01)
-                (< (cadadr a) (cadadr b)))
-           T)
-          (T nil)
+(defun mc:text-values-total-diff (inchNums metricNums / pairs total p)
+  (setq pairs (mc:global-best-number-pairs inchNums metricNums))
+  (if pairs
+    (progn (setq total 0.0) (foreach p pairs (setq total (+ total (cadddr p)))) total)
+    nil
+  )
+)
+(defun mc:find-best-text-match (iEntry metricList / iNums mNums best bestScore bestVDiff bestPDist mEntry vDiff pDist score)
+  ;; Clean value match only, category-safe.
+  (setq iNums (mc:extract-conversion-numbers (car iEntry)) best nil bestScore nil bestVDiff nil bestPDist nil)
+  (if iNums
+    (foreach mEntry metricList
+      (if (mc:same-text-kind-p iEntry mEntry)
+        (progn
+          (setq mNums (mc:extract-conversion-numbers-metric (car mEntry)))
+          (setq vDiff (mc:text-values-total-diff iNums mNums))
+          (if vDiff
+            (progn
+              (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
+              (if (<= vDiff *mc-tolerance*)
+                (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
+                (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
+              )
+              (if (or (not bestScore) (< score bestScore))
+                (setq best mEntry bestScore score bestVDiff vDiff bestPDist pDist)
+              )
+            )
+          )
         )
       )
     )
   )
+  (if (and best bestVDiff (<= bestVDiff *mc-text-max-sane-diff*)) (list best bestVDiff bestPDist) nil)
+)
+(defun mc:find-nearest-text-match (iEntry metricList / best bestD d mEntry)
+  ;; Category-safe positional fallback. This is what makes wrong paired attributes fail instead of ??,
+  ;; without allowing DIA to match TOL.
+  (setq best nil bestD nil)
+  (foreach mEntry metricList
+    (if (and (mc:same-text-kind-p iEntry mEntry) (mc:extract-conversion-numbers-metric (car mEntry)))
+      (progn
+        (setq d (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
+        (if (and (< d *mc-text-position-limit*) (or (not bestD) (< d bestD)))
+          (setq best mEntry bestD d)
+        )
+      )
+    )
+  )
+  (if best (list best bestD) nil)
 )
 
+(defun mc:unmatched-by-index (lst used / result idx x)
+  (setq result nil idx 0)
+  (foreach x lst
+    (if (not (mc:member-int idx used))
+      (setq result (cons x result))
+    )
+    (setq idx (1+ idx))
+  )
+  (reverse result)
+)
+
+(defun mc:global-dim-assignments (inchList metricList
+                                  / candidates sorted assignments usedI usedM
+                                    iIdx mIdx iEntry mEntry iVal mVal expected
+                                    vDiff pDist score cand)
+  ;; Build every possible edge first, then choose the best non-conflicting
+  ;; assignments. This removes order-dependence from repeated/similar dims.
+  (setq candidates nil iIdx 0)
+  (foreach iEntry inchList
+    (setq iVal (car iEntry) mIdx 0)
+    (foreach mEntry metricList
+      (setq mVal (car mEntry))
+      (if (and (numberp iVal) (numberp mVal))
+        (progn
+          (setq expected (* (abs iVal) *mc-conv*))
+          (setq vDiff (abs (- (abs mVal) expected)))
+          (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
+          (if (<= vDiff *mc-tolerance*)
+            (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
+            (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
+          )
+          (setq candidates (cons (list score iIdx mIdx iEntry mEntry vDiff pDist) candidates))
+        )
+      )
+      (setq mIdx (1+ mIdx))
+    )
+    (setq iIdx (1+ iIdx))
+  )
+  (setq sorted (vl-sort candidates '(lambda (a b) (< (car a) (car b)))))
+  (setq assignments nil usedI nil usedM nil)
+  (foreach cand sorted
+    (if (and (not (mc:member-int (cadr cand) usedI))
+             (not (mc:member-int (caddr cand) usedM)))
+      (progn
+        (setq assignments (cons cand assignments))
+        (setq usedI (cons (cadr cand) usedI))
+        (setq usedM (cons (caddr cand) usedM))
+      )
+    )
+  )
+  (list
+    (vl-sort assignments '(lambda (a b) (< (cadr a) (cadr b))))
+    (mc:unmatched-by-index inchList usedI)
+    (mc:unmatched-by-index metricList usedM))
+)
+
+(defun mc:global-text-assignments (inchList metricList
+                                   / candidates sorted assignments usedI usedM
+                                     iIdx mIdx iEntry mEntry iNums mNums
+                                     vDiff pDist score cand)
+  ;; Value edges are preferred. Position edges are retained as a strict
+  ;; category-safe fallback so a nearby wrong value fails instead of becoming
+  ;; two unrelated ?? marks.
+  (setq candidates nil iIdx 0)
+  (foreach iEntry inchList
+    (setq iNums (mc:extract-conversion-numbers (car iEntry)))
+    (if iNums
+      (progn
+        (setq mIdx 0)
+        (foreach mEntry metricList
+          (if (mc:same-text-kind-p iEntry mEntry)
+            (progn
+              (setq mNums (mc:extract-conversion-numbers-metric (car mEntry)))
+              (if mNums
+                (progn
+                  (setq vDiff (mc:text-values-total-diff iNums mNums))
+                  (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
+                  (if (and vDiff (<= vDiff *mc-text-max-sane-diff*))
+                    (progn
+                      (if (<= vDiff *mc-tolerance*)
+                        (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
+                        (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
+                      )
+                      (setq candidates (cons (list score iIdx mIdx iEntry mEntry vDiff pDist 'VALUE) candidates))
+                    )
+                  )
+                  (if (< pDist *mc-text-position-limit*)
+                    (setq candidates (cons (list (+ 2000000.0 pDist) iIdx mIdx iEntry mEntry vDiff pDist 'POSITION) candidates))
+                  )
+                )
+              )
+            )
+          )
+          (setq mIdx (1+ mIdx))
+        )
+      )
+    )
+    (setq iIdx (1+ iIdx))
+  )
+  (setq sorted (vl-sort candidates '(lambda (a b) (< (car a) (car b)))))
+  (setq assignments nil usedI nil usedM nil)
+  (foreach cand sorted
+    (if (and (not (mc:member-int (cadr cand) usedI))
+             (not (mc:member-int (caddr cand) usedM)))
+      (progn
+        (setq assignments (cons cand assignments))
+        (setq usedI (cons (cadr cand) usedI))
+        (setq usedM (cons (caddr cand) usedM))
+      )
+    )
+  )
+  (list
+    (vl-sort assignments '(lambda (a b) (< (cadr a) (cadr b))))
+    (mc:unmatched-by-index inchList usedI)
+    (mc:unmatched-by-index metricList usedM))
+)
+
+(defun mc:sort-by-pos (lst /)
+  (vl-sort lst '(lambda (a b)
+    (cond
+      ((not (mc:xy-p (cadr a))) nil)
+      ((not (mc:xy-p (cadr b))) T)
+      ((< (caadr a) (caadr b)) T)
+      ((and (equal (caadr a) (caadr b) 0.01) (< (cadadr a) (cadadr b))) T)
+      (T nil)))))
+
+;;; -------------------------------------------------------------------
+;;; Layers / balloons
+;;; -------------------------------------------------------------------
+(defun mc:balloon-height (/ dtxt dscl sz)
+  (setq dtxt (getvar "DIMTXT") dscl (getvar "DIMSCALE") sz (* (max dtxt 0.05) (max dscl 1.0) 0.85))
+  (max sz 0.5)
+)
+(defun mc:ensure-layer (doc lname color / layers layerRes addRes)
+  (setq layers (vla-get-Layers doc) layerRes (vl-catch-all-apply 'vla-item (list layers lname)))
+  (if (vl-catch-all-error-p layerRes)
+    (progn (setq addRes (vl-catch-all-apply 'vla-add (list layers lname))) (if (not (vl-catch-all-error-p addRes)) (vla-put-Color addRes color)))
+    (vla-put-Color layerRes color))
+)
+(defun mc:delete-layer (lname / doc layers layerRes delRes)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)) layers (vla-get-Layers doc) layerRes (vl-catch-all-apply 'vla-item (list layers lname)))
+  (if (not (vl-catch-all-error-p layerRes))
+    (progn
+      (if (= (strcase (getvar "CLAYER")) (strcase lname)) (setvar "CLAYER" "0"))
+      (setq delRes (vl-catch-all-apply 'vla-delete (list layerRes)))
+      (if (vl-catch-all-error-p delRes) (vl-catch-all-apply 'command (list "._-PURGE" "_La" lname "_No")))
+    )
+  )
+)
+(defun mc:clear-qc-layers (/ ss i lname)
+  (foreach lname (list "MC_PASS" "MC_ERRORS")
+    (setq ss (ssget "X" (list (cons 8 lname))))
+    (if ss (progn (setq i 0) (repeat (sslength ss) (entdel (ssname ss i)) (setq i (1+ i)))))
+    (mc:delete-layer lname)
+  )
+)
+(defun mc:place-balloon (px py bh isPass body / ins label layer color bw ed)
+  (setq ins (list px (+ py (* bh 0.75)) 0.0))
+  (if isPass (setq layer "MC_PASS" color 3) (setq layer "MC_ERRORS" color 7))
+  (setq label (strcat "{\\fArial|b1|i0;" body "}"))
+  (setq bw (max (* (strlen label) bh 0.50) (* bh 3.0)))
+  (setq ed (list (cons 0 "MTEXT") (cons 100 "AcDbEntity") (cons 8 layer) (cons 62 color)
+                 (cons 100 "AcDbMText") (cons 10 ins) (cons 40 bh) (cons 41 bw)
+                 (cons 71 1) (cons 72 1) (cons 1 label)))
+  (vl-catch-all-apply 'entmake (list ed))
+)
+(defun mc:make-label (inchVal expected actual /) (strcat (mc:fmt inchVal) "\"" "  exp " (mc:fmt expected) "mm" "  got " (mc:fmt actual) "mm"))
+(defun mc:make-pass-label (/) "\\U+2713")
+(defun mc:make-missing-label (inchVal expected /) (strcat "??  " (mc:fmt inchVal) "\"" "  exp " (mc:fmt expected) "mm"))
+(defun mc:make-unmatched-metric-label (metricVal /) (strcat "??  got " (mc:fmt metricVal) "mm"))
+(defun mc:get-current-dwg-folder (/ p) (setq p (getvar "DWGPREFIX")) (if (or (not p) (= p "")) (setq p "")) p)
 
 ;;; ===================================================================
-;;; c:metric_check  --  the AutoCAD command
+;;; c:metric_check
 ;;; ===================================================================
 (defun c:metric_check
-    (/ acadObj metricDoc inchFile openRes inchDoc
-       ;;-- dimension vars
-       metricDims inchDims mDimLen iDimLen dimN
-       ;;-- text vars
-       metricTexts inchTexts mTxtLen iTxtLen txtN
-       ;;-- shared loop vars
-       i j iVal mVal expected diff tolerance
-       ;;-- text-specific loop vars
-       iEntry mEntry iStr mStr iNums mNums iNLen
-       iNumPair mNumPair iNum mNum isDecimal
-       ;;-- error accumulators
-       dimErrors txtErrors errLine
-       dimPass dimFail txtPass txtFail
-       ;;-- report
-       report)
+    (/ *error* oldError oldCmdecho acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
+       metricDims inchDims metricTexts inchTexts iDimLen mDimLen iTxtLen mTxtLen
+       iEntry mEntry assignment iVal mVal expected diff errPos passFlag missingPos
+       iStr mStr iNums mNums pairs pair iNum mNum dimMarkers txtMarkers txtBody anyFail
+       remainingMetricDims remainingMetricTexts unmatchedInchDims unmatchedInchTexts
+       dimPlan textPlan dimAssignments textAssignments balloonH errIdx dimPass dimFail txtPass txtFail
+       missingDimCount unmatchedMetricDimCount textMissingCount ignoredMetricTexts m)
 
   (vl-load-com)
+  (setq oldError *error*
+        oldCmdecho (getvar "CMDECHO")
+        *mc-active-inch-doc* nil
+        *mc-active-inch-dbx* nil)
 
-  ;;----------------------------------------------------------------
-  ;; 1. Store the currently active (metric) document reference first
-  ;;----------------------------------------------------------------
-  (setq acadObj   (vlax-get-acad-object)
-        metricDoc (vla-get-ActiveDocument acadObj))
+  (defun *error* (msg)
+    (if *mc-active-inch-doc*
+      (mc:close-inch-source-doc *mc-active-inch-doc* *mc-active-inch-dbx*)
+    )
+    (setq *mc-active-inch-doc* nil
+          *mc-active-inch-dbx* nil)
+    (if metricDoc (vl-catch-all-apply 'vla-Activate (list metricDoc)))
+    (if oldCmdecho (setvar "CMDECHO" oldCmdecho))
+    (setq *error* oldError)
+    (if (and msg
+             (not (wcmatch (strcase msg) "*CANCEL*,*QUIT*,*BREAK*")))
+      (princ (strcat "\nMETRIC_CHECK error: " msg))
+    )
+    (princ)
+  )
 
-  ;;----------------------------------------------------------------
-  ;; 2. Read all data from metric drawing BEFORE opening anything else
-  ;;----------------------------------------------------------------
+  (setq acadObj (vlax-get-acad-object)
+        metricDoc (vla-get-ActiveDocument acadObj)
+        metricDir (mc:get-current-dwg-folder))
+
   (princ "\nReading metric drawing...")
-  (setq metricDims  (mc:get-dims  metricDoc))
+  (setq metricDims (mc:get-dims metricDoc))
   (setq metricTexts (mc:get-texts metricDoc))
-  (princ
-    (strcat " "
-            (itoa (length metricDims))  " dim(s), "
-            (itoa (length metricTexts)) " text/mtext entity(s) found."))
+  (princ (strcat " " (itoa (length metricDims)) " dim(s), " (itoa (length metricTexts)) " text/mtext/attribute found."))
 
-  ;;----------------------------------------------------------------
-  ;; 3. Prompt the user to pick the inch source drawing
-  ;;----------------------------------------------------------------
-  (setq inchFile (getfiled "Select Inch Source Drawing" "" "dwg" 4))
+  (setq inchFile (getfiled "Select Inch Source Drawing" metricDir "dwg" 4))
   (if (not inchFile)
+    (princ "\nmetric_check: Cancelled.")
     (progn
-      (princ "\nmetric_check: Cancelled by user.")
-      (princ)
-      (exit)
-    )
-  )
+      (princ "\nOpening inch source invisibly using ObjectDBX when available...")
+      (setq inchOpen (mc:open-inch-source-doc acadObj inchFile))
+      (if (not inchOpen)
+        (princ "\nERROR: Could not open inch source drawing.")
+        (progn
+          (setq inchDoc (car inchOpen)
+                inchIsDbx (cadr inchOpen)
+                *mc-active-inch-doc* inchDoc
+                *mc-active-inch-dbx* inchIsDbx)
+          (if inchIsDbx
+            (princ " ObjectDBX OK, no visible inch drawing window.")
+            (princ " ObjectDBX unavailable, used read-only visible fallback and will close it."))
 
-  ;;----------------------------------------------------------------
-  ;; 4. Open inch drawing read-only
-  ;;----------------------------------------------------------------
-  (princ (strcat "\nOpening: " inchFile " ..."))
-  (setq openRes
-    (vl-catch-all-apply 'vla-open
-      (list (vla-get-Documents acadObj) inchFile vlax-true)))
+          (princ "\nReading inch drawing...")
+          (setq inchDims (mc:get-dims inchDoc))
+          (setq inchTexts (mc:get-texts inchDoc))
+          (princ (strcat " " (itoa (length inchDims)) " dim(s), " (itoa (length inchTexts)) " text/mtext/attribute found."))
 
-  (if (vl-catch-all-error-p openRes)
-    (progn
-      (alert
-        (strcat "ERROR: Could not open the file.\n"
-                (vl-catch-all-error-message openRes)))
-      (princ)
-      (exit)
-    )
-  )
-  (setq inchDoc openRes)
+          (mc:close-inch-source-doc inchDoc inchIsDbx)
+          (setq *mc-active-inch-doc* nil *mc-active-inch-dbx* nil)
+          (vla-Activate metricDoc)
 
-  ;;----------------------------------------------------------------
-  ;; 5. Read all data from the inch drawing
-  ;;----------------------------------------------------------------
-  (princ "\nReading inch drawing...")
-  (setq inchDims  (mc:get-dims  inchDoc))
-  (setq inchTexts (mc:get-texts inchDoc))
-  (princ
-    (strcat " "
-            (itoa (length inchDims))  " dim(s), "
-            (itoa (length inchTexts)) " text/mtext entity(s) found."))
+          (setq metricDims (mc:sort-by-pos metricDims))
+          (setq inchDims (mc:sort-by-pos inchDims))
+          (setq metricTexts (mc:sort-by-pos metricTexts))
+          (setq inchTexts (mc:sort-by-pos inchTexts))
 
-  ;;----------------------------------------------------------------
-  ;; 6. Close inch drawing and restore metric document
-  ;;----------------------------------------------------------------
-  (vla-close inchDoc vlax-false)
-  (vla-Activate metricDoc)
+          (setq dimMarkers nil txtMarkers nil dimPass 0 dimFail 0 txtPass 0 txtFail 0
+                missingDimCount 0 unmatchedMetricDimCount 0 textMissingCount 0 ignoredMetricTexts 0)
+          (setq mDimLen (length metricDims) iDimLen (length inchDims) mTxtLen (length metricTexts) iTxtLen (length inchTexts))
 
-  ;;----------------------------------------------------------------
-  ;; 7. Sort all four lists by XY position
-  ;;----------------------------------------------------------------
-  (setq metricDims  (mc:sort-by-pos metricDims))
-  (setq inchDims    (mc:sort-by-pos inchDims))
-  (setq metricTexts (mc:sort-by-pos metricTexts))
-  (setq inchTexts   (mc:sort-by-pos inchTexts))
+          (if (/= mDimLen iDimLen)
+            (princ (strcat "\nInfo: dimension count differs: " (itoa iDimLen) " inch vs " (itoa mDimLen) " metric.")))
+          (if (/= mTxtLen iTxtLen)
+            (princ (strcat "\nInfo: text/attribute count differs: " (itoa iTxtLen) " inch vs " (itoa mTxtLen) " metric. Ignored blocks: C, REVSYMB, REVC.")))
 
-  ;;----------------------------------------------------------------
-  ;; 8. Initialise accumulators
-  ;;----------------------------------------------------------------
-  (setq tolerance 0.1
-        dimErrors nil   txtErrors nil
-        dimPass   0     dimFail   0
-        txtPass   0     txtFail   0)
+          ;; --------------------------- dimension check -----------------------
+          (setq dimPlan (mc:global-dim-assignments inchDims metricDims)
+                dimAssignments (car dimPlan)
+                unmatchedInchDims (cadr dimPlan)
+                remainingMetricDims (caddr dimPlan))
 
-  ;;----------------------------------------------------------------
-  ;; 9. DIMENSION CHECK
-  ;;----------------------------------------------------------------
-  (setq mDimLen (length metricDims)
-        iDimLen (length inchDims)
-        dimN    (min mDimLen iDimLen)
-        i       0)
-
-  (if (zerop dimN)
-    (princ "\nNo dimension entities to compare.")
-    (progn
-      (princ (strcat "\nChecking " (itoa dimN) " dimension(s)..."))
-      (repeat dimN
-        (setq iVal    (car (nth i inchDims))
-              mVal    (car (nth i metricDims))
-              expected (* iVal 25.4)
-              diff    (abs (- mVal expected)))
-        (if (> diff tolerance)
-          (progn
-            (setq dimFail (1+ dimFail))
-            (setq errLine
-              (strcat
-                "Dim #" (itoa (1+ i))
-                "   " (mc:fmt iVal 4) "\""
-                " x25.4 = " (mc:fmt expected 3) "mm"
-                "   found: " (mc:fmt mVal 3) "mm"
-                "   off by: " (mc:fmt diff 3) "mm  <--"))
-            (setq dimErrors (cons errLine dimErrors))
+          (foreach assignment dimAssignments
+            (setq iEntry (nth 3 assignment)
+                  mEntry (nth 4 assignment)
+                  diff (nth 5 assignment)
+                  iVal (car iEntry)
+                  mVal (car mEntry)
+                  expected (if (numberp iVal) (* (abs iVal) *mc-conv*) nil)
+                  errPos (cadr mEntry))
+            (setq passFlag (and (numberp mVal) (numberp expected) (<= diff *mc-tolerance*)))
+            (if passFlag (setq dimPass (1+ dimPass)) (setq dimFail (1+ dimFail)))
+            (setq dimMarkers
+              (cons (list passFlag (if passFlag (mc:make-pass-label) (mc:make-label iVal expected mVal)) errPos)
+                    dimMarkers))
           )
-          (setq dimPass (1+ dimPass))
-        )
-        (setq i (1+ i))
-      )
-    )
-  )
 
-  ;;----------------------------------------------------------------
-  ;; 10. TEXT / MTEXT CHECK
-  ;;
-  ;; For each matched text pair:
-  ;;   - Extract all numbers as (value isDecimal) from both strings
-  ;;   - If counts match, compare each pair:
-  ;;       metric  ~= inch x 25.4          -> PASS
-  ;;       metric  ~= inch  AND isDecimal  -> WARN (likely missed conversion)
-  ;;       metric  ~= inch  AND NOT isDecimal -> silent skip (note/count number)
-  ;;       neither condition               -> FAIL (wrong conversion)
-  ;;----------------------------------------------------------------
-  (setq mTxtLen (length metricTexts)
-        iTxtLen (length inchTexts)
-        txtN    (min mTxtLen iTxtLen)
-        i       0)
+          (foreach iEntry unmatchedInchDims
+            (setq iVal (car iEntry)
+                  expected (if (numberp iVal) (* (abs iVal) *mc-conv*) nil)
+                  missingDimCount (1+ missingDimCount)
+                  dimFail (1+ dimFail)
+                  missingPos (mc:scale-point (cadr iEntry) *mc-conv*))
+            (if (not (mc:xy-p missingPos)) (setq missingPos (cadr iEntry)))
+            (if (mc:xy-p missingPos)
+              (setq dimMarkers (cons (list nil (mc:make-missing-label iVal expected) missingPos) dimMarkers))
+            )
+          )
 
-  (if (zerop txtN)
-    (princ "\nNo text entities to compare.")
-    (progn
-      (princ (strcat "\nChecking " (itoa txtN) " text/mtext pair(s)..."))
-      (repeat txtN
-        (setq iEntry (nth i inchTexts)
-              mEntry (nth i metricTexts)
-              iStr   (car iEntry)
-              mStr   (car mEntry)
-              iNums  (mc:extract-numbers iStr)
-              mNums  (mc:extract-numbers mStr))
+          (foreach mEntry remainingMetricDims
+            (setq unmatchedMetricDimCount (1+ unmatchedMetricDimCount) dimFail (1+ dimFail))
+            (setq dimMarkers (cons (list nil (mc:make-unmatched-metric-label (car mEntry)) (cadr mEntry)) dimMarkers))
+          )
 
-        ;;-- Only compare pairs where both sides have numbers
-        ;;-- and the count of numbers is the same
-        (if (and iNums
-                 mNums
-                 (= (length iNums) (length mNums)))
-          (progn
-            (setq iNLen (length iNums)
-                  j     0)
-            (repeat iNLen
-              (setq iNumPair  (nth j iNums)
-                    mNumPair  (nth j mNums)
-                    iNum      (car  iNumPair)
-                    isDecimal (cadr iNumPair)
-                    mNum      (car  mNumPair)
-                    expected  (* iNum 25.4)
-                    diff      (abs (- mNum expected)))
-              (cond
-                ;;-- Correctly converted within tolerance
-                ((<= diff tolerance)
-                 (setq txtPass (1+ txtPass))
+          ;; ------------------------ text/attribute check ---------------------
+          (setq textPlan (mc:global-text-assignments inchTexts metricTexts)
+                textAssignments (car textPlan)
+                unmatchedInchTexts (cadr textPlan)
+                remainingMetricTexts (caddr textPlan))
+
+          (foreach assignment textAssignments
+            (setq iEntry (nth 3 assignment)
+                  mEntry (nth 4 assignment)
+                  iStr (car iEntry)
+                  mStr (car mEntry)
+                  errPos (cadr mEntry)
+                  iNums (mc:extract-conversion-numbers iStr)
+                  mNums (mc:extract-conversion-numbers-metric mStr)
+                  pairs (mc:global-best-number-pairs iNums mNums))
+            (if pairs
+              (progn
+                (setq txtBody nil anyFail nil)
+                (foreach pair pairs
+                  (setq iNum (car pair) mNum (cadr pair) expected (caddr pair) diff (cadddr pair))
+                  (if (> diff *mc-tolerance*)
+                    (setq anyFail T txtFail (1+ txtFail))
+                    (setq txtPass (1+ txtPass))
+                  )
+                  (setq txtBody (if txtBody (strcat txtBody "  |  " (mc:make-label iNum expected mNum)) (mc:make-label iNum expected mNum)))
                 )
-                ;;-- Value is unchanged AND it was a decimal: likely
-                ;;   the conversion was simply forgotten
-                ((and isDecimal (equal mNum iNum 0.001))
-                 (setq txtFail (1+ txtFail))
-                 (setq errLine
-                   (strcat
-                     "Text #" (itoa (1+ i))
-                     "  value " (mc:fmt iNum 4)
-                     " is UNCHANGED  (expected "
-                     (mc:fmt expected 3) "mm)"
-                     "  [" iStr "]"))
-                 (setq txtErrors (cons errLine txtErrors))
-                )
-                ;;-- Decimal number but wrong converted value
-                (isDecimal
-                 (setq txtFail (1+ txtFail))
-                 (setq errLine
-                   (strcat
-                     "Text #" (itoa (1+ i))
-                     "   " (mc:fmt iNum 4) "\""
-                     " x25.4 = " (mc:fmt expected 3) "mm"
-                     "   found: " (mc:fmt mNum 3) "mm"
-                     "   off: " (mc:fmt diff 3) "mm"
-                     "  [" iStr "] -> [" mStr "]"))
-                 (setq txtErrors (cons errLine txtErrors))
-                )
-                ;;-- Integer that is unchanged: skip silently
-                ;;   (e.g. note numbers, quantity counts, item tags)
-                (T nil)
+                (setq txtMarkers (cons (list (not anyFail) (if (not anyFail) (mc:make-pass-label) txtBody) errPos) txtMarkers))
               )
-              (setq j (1+ j))
+              (progn
+                (setq textMissingCount (1+ textMissingCount) txtFail (1+ txtFail))
+                (setq txtMarkers (cons (list nil (mc:make-missing-label (car iNums) (* (abs (car iNums)) *mc-conv*)) (cadr iEntry)) txtMarkers))
+              )
+            )
+          )
+
+          (foreach iEntry unmatchedInchTexts
+            (setq iNums (mc:extract-conversion-numbers (car iEntry)))
+            (if iNums
+              (progn
+                (setq textMissingCount (1+ textMissingCount) txtFail (1+ txtFail))
+                (setq txtMarkers (cons (list nil (mc:make-missing-label (car iNums) (* (abs (car iNums)) *mc-conv*)) (cadr iEntry)) txtMarkers))
+              )
+            )
+          )
+
+          ;; Leftover metric text/attrs: only report if still dimensional and category-valid.
+          (foreach mEntry remainingMetricTexts
+            (setq mNums (mc:extract-conversion-numbers-metric (car mEntry)))
+            (if mNums
+              (progn
+                (setq txtFail (1+ txtFail))
+                (setq txtMarkers (cons (list nil (mc:make-unmatched-metric-label (car mNums)) (cadr mEntry)) txtMarkers))
+              )
+              (setq ignoredMetricTexts (1+ ignoredMetricTexts))
+            )
+          )
+
+          ;; ----------------------------- output ------------------------------
+          (princ "\nUpdating QC layers...")
+          (mc:clear-qc-layers)
+          (mc:ensure-layer metricDoc "MC_PASS" 3)
+          (mc:ensure-layer metricDoc "MC_ERRORS" 7)
+
+          (setq balloonH (mc:balloon-height) errIdx 1)
+          (foreach m (reverse dimMarkers)
+            (mc:place-balloon (car (caddr m)) (cadr (caddr m)) balloonH (car m) (cadr m))
+            (if (not (car m)) (progn (princ (strcat "\n  [" (itoa errIdx) "] DIM FAIL/MISSING: " (cadr m))) (setq errIdx (1+ errIdx))))
+          )
+          (foreach m (reverse txtMarkers)
+            (mc:place-balloon (car (caddr m)) (cadr (caddr m)) balloonH (car m) (cadr m))
+            (if (not (car m)) (progn (princ (strcat "\n  [" (itoa errIdx) "] TXT/ATTR FAIL/MISSING: " (cadr m))) (setq errIdx (1+ errIdx))))
+          )
+
+          (if (zerop (+ dimFail txtFail)) (princ "\nAll checked conversions PASSED."))
+          (vla-Regen metricDoc 2)
+
+          (princ
+            (strcat
+              "\n--------------------------------------------\n"
+              "METRIC CHECK DONE v15.0-CANONICAL-PRO\n"
+              "  Dimensions : " (itoa dimPass) " pass  " (itoa dimFail) " fail/missing\n"
+              "  Text/MText/Attr : " (itoa txtPass) " pass  " (itoa txtFail) " fail/missing\n"
+              "  Missing inch dimension matches : " (itoa missingDimCount) "\n"
+              "  Unmatched metric dimensions   : " (itoa unmatchedMetricDimCount) "\n"
+              "  Suspicious/missing text/attr  : " (itoa textMissingCount) "\n"
+              "  Ignored non-dimensional metric text/attr : " (itoa ignoredMetricTexts) "\n"
+              "  Ignored block names : C, REVSYMB, REVC\n"
+              "  Inch source open mode : " (if inchIsDbx "ObjectDBX invisible" "visible fallback read-only") "\n"
+              "  Key fixes : global assignment; DIA/RAD before TOL; safe source cleanup\n"
+              "--------------------------------------------"
             )
           )
         )
-        (setq i (1+ i))
       )
     )
   )
-
-  ;;----------------------------------------------------------------
-  ;; 11. Build the report string
-  ;;----------------------------------------------------------------
-  (setq report
-    (strcat "METRIC CHECK REPORT\n"
-            (mc:dashes 52) "\n\n"))
-
-  ;;-- Dimensions section
-  (setq report (strcat report "[ DIMENSIONS ]\n"))
-  (if (/= mDimLen iDimLen)
-    (setq report
-      (strcat report
-        "  ! Count mismatch -- Inch: " (itoa iDimLen)
-        "  Metric: " (itoa mDimLen)
-        "  (comparing " (itoa dimN) ")\n"))
-  )
-  (if (zerop dimFail)
-    (setq report
-      (strcat report
-        "  PASS -- All " (itoa dimPass) " dimension(s) correct.\n"))
-    (progn
-      (setq report
-        (strcat report
-          "  FAIL -- " (itoa dimFail)
-          " error(s) in " (itoa dimN) " dimension(s):\n"))
-      (foreach e (reverse dimErrors)
-        (setq report (strcat report "  " e "\n")))
-    )
-  )
-
-  ;;-- Text section
-  (setq report (strcat report "\n[ TEXT / MTEXT ]\n"))
-  (if (/= mTxtLen iTxtLen)
-    (setq report
-      (strcat report
-        "  ! Count mismatch -- Inch: " (itoa iTxtLen)
-        "  Metric: " (itoa mTxtLen)
-        "  (comparing " (itoa txtN) ")\n"))
-  )
-  (if (zerop txtFail)
-    (setq report
-      (strcat report
-        "  PASS -- All " (itoa txtPass) " text value(s) correct.\n"))
-    (progn
-      (setq report
-        (strcat report
-          "  FAIL -- " (itoa txtFail)
-          " text error(s) found:\n"))
-      (foreach e (reverse txtErrors)
-        (setq report (strcat report "  " e "\n")))
-    )
-  )
-
-  ;;-- Footer
-  (setq report
-    (strcat report
-      "\n" (mc:dashes 52) "\n"
-      "Tolerance : +/- " (mc:fmt tolerance 2) " mm\n"
-      "Total errors : "
-      (itoa (+ dimFail txtFail))
-      "  (" (itoa dimFail) " dim + "
-      (itoa txtFail) " text)"))
-
-  ;;----------------------------------------------------------------
-  ;; 12. Show report (popup + command line echo)
-  ;;----------------------------------------------------------------
-  (alert report)
-  (princ "\n")
-  (princ report)
+  (if oldCmdecho (setvar "CMDECHO" oldCmdecho))
+  (setq *error* oldError)
   (princ)
 )
 
-(princ "\nMETRIC_CHECK.LSP v2 loaded. Type METRIC_CHECK to run.")
+(defun mc:selftest-check (name ok /)
+  (princ (strcat "\n  " (if ok "PASS " "FAIL ") name))
+  ok
+)
+
+(defun c:mc_selftest (/ pass fail ok nums kind pairs plan)
+  (setq pass 0 fail 0)
+  (princ "\nMETRIC_CHECK self-test")
+
+  (setq nums (mc:extract-conversion-numbers "%%C.03 [.76]"))
+  (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
+  (if (mc:selftest-check "diameter decimal extraction" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq kind (mc:text-kind "%%C.03 [.76]" nil))
+  (setq ok (eq kind 'DIA))
+  (if (mc:selftest-check "small diameter stays DIA, not TOL" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (mc:extract-conversion-numbers "SHEET 12 REV 3"))
+  (setq ok (null nums))
+  (if (mc:selftest-check "title-block noise ignored" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (mc:extract-conversion-numbers "-.125"))
+  (setq ok (and nums (equal (car nums) -0.125 1e-8)))
+  (if (mc:selftest-check "signed decimal extraction" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq pairs (mc:global-best-number-pairs (list 0.125) (list 3.18)))
+  (setq ok (and pairs (<= (cadddr (car pairs)) *mc-tolerance*)))
+  (if (mc:selftest-check "inch-to-mm value pair" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq plan
+    (mc:global-text-assignments
+      (list (list "%%C.03" (list 0.0 0.0)) (list ".125" (list 100.0 0.0)))
+      (list (list "3.18" (list 100.0 0.0)) (list "%%C.76" (list 0.0 0.0)))))
+  (setq ok (= (length (car plan)) 2))
+  (if (mc:selftest-check "global text assignment handles swapped order" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (princ (strcat "\nMETRIC_CHECK self-test done: " (itoa pass) " pass, " (itoa fail) " fail."))
+  (princ)
+)
+
+(defun c:metric_clear (/)
+  (vl-load-com)
+  (mc:clear-qc-layers)
+  (vla-Regen (vla-get-ActiveDocument (vlax-get-acad-object)) 2)
+  (princ "\nMC_PASS and MC_ERRORS balloons and layers removed.")
+  (princ)
+)
+
+(princ "\nMETRIC_CHECK.LSP v15.0-CANONICAL-PRO loaded.")
+(princ "\n  METRIC_CHECK -- ObjectDBX no-window source read, category-safe matching")
+(princ "\n  METRIC_CLEAR -- erase all QC balloons and layers")
+(princ "\n  MC_SELFTEST -- parser/matcher self-test")
 (princ)
