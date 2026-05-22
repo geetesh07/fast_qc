@@ -760,7 +760,7 @@
               (list (cons 0 "LINE")
                     (cons 100 "AcDbEntity")
                     (cons 8 layer)
-                    (cons 62 DQC:LEADER-COLOR)
+                    (cons 62 color)
                     (cons 100 "AcDbLine")
                     (cons 10 txtpt)
                     (cons 11 ins))))))
@@ -1497,10 +1497,8 @@
              (DQC:place-balloon pt th 0.0 label layer)))))))
   (list total pass fail))
 
-;;; Mode 3 FT-LB [N-m] torque check in text entities.
-;;; no-miss-mark=T means: if no [N-m] bracket found, place NO mark at all.
-;;; This prevents false ticks on annotations that have no metric equivalent shown.
-;;; Build entity info list from all MTEXT/TEXT (excluding QC layers).
+;;; Collect all MTEXT/TEXT entity records (excluding QC layers).
+;;; Returns list of (ename txt pt th) records.
 (defun DQC:collect-text-entities (/ ss len i ename txt pt th result)
   (setq result nil)
   (setq ss (ssget "X" (list (cons 0 "MTEXT,TEXT"))))
@@ -1518,41 +1516,60 @@
         (setq i (1+ i)))))
   result)
 
-;;; Mode 3 FT-LB [N-m] torque check.  Self-contained: builds its own entity list.
+;;; Pre-filter an entity list to only those containing kwl keywords, altl keywords,
+;;; or a "[" bracket.  Reduces O(n^2) scan from n=all-entities to n=relevant-only.
+(defun DQC:filter-ent-for-kw (ent-list kwl altl / result rec txt)
+  (setq result nil)
+  (foreach rec ent-list
+    (setq txt (nth 1 rec))
+    (if (and txt
+             (or (DQC:find-prim-hits txt kwl)
+                 (DQC:find-alt-in-string txt altl 1)
+                 (> (DQC:find-char txt "[" 1) 0)))
+      (setq result (append result (list rec)))))
+  result)
+
+;;; Mode 3 FT-LB [N-m] torque check.
+;;; Takes pre-collected entity list; pre-filters before O(n^2) scan.
 ;;; no-miss-mark=T: only marks when a [N-m] bracket is found near FT-LB value.
-(defun DQC:run-mode3-torque (/ ent-info-list res total pass fail)
-  (setq ent-info-list (DQC:collect-text-entities))
+(defun DQC:run-mode3-torque (ent-info-list / filtered res total pass fail)
+  (setq filtered
+    (DQC:filter-ent-for-kw ent-info-list
+      (list "FT-LB" "FT.LB" "FTLB" "FT LB")
+      (list "N-M" "N.M" "NM" "N M")))
   (setq res
     (DQC:match-cross-entity
-      ent-info-list
+      filtered
       (list
-        ;; FT-LB -> N-M only (not IN-LB - that is Mode 1 scope)
         (list (list "FT-LB" "FT.LB" "FTLB" "FT LB")
               (list "N-M" "N.M" "NM" "N M")
               1.355818 "FT-LB" "N-M" 1 2 0.5 T))))
   (setq total (car res) pass (cadr res) fail (caddr res))
   (list total pass fail))
 
-;;; Mode 3 LB [KG] weight check.  Self-contained: builds its own entity list.
+;;; Mode 3 LB [KG] weight check.
+;;; Takes pre-collected entity list; pre-filters before O(n^2) scan.
 ;;; no-miss-mark=T: silently skip if no [KG] bracket present.
-(defun DQC:run-mode3-weight (/ ent-info-list res)
-  (setq ent-info-list (DQC:collect-text-entities))
+(defun DQC:run-mode3-weight (ent-info-list / filtered res)
+  (setq filtered
+    (DQC:filter-ent-for-kw ent-info-list
+      (list "LBS" "LB")
+      (list "KG")))
   (setq res
     (DQC:match-cross-entity
-      ent-info-list
+      filtered
       (list
         (list (list "LBS" "LB") (list "KG") 0.453592 "LB" "KG" 1 2 0.5 T))))
   res)
 
 ;;; Mode 3 block (INSERT) attribute scanning.
+;;; Takes pre-collected entity list (bracket-only pre-filtered for speed).
 ;;; Reads numeric attributes from non-skipped blocks and finds nearby [mm] text.
-;;; Also checks IN-LB->N-m and PSI->kPa from attribute values where applicable.
-(defun DQC:run-block-attrs (doc / ent-info-list ss len i ename ed bname
+(defun DQC:run-block-attrs (doc ent-info-list / ss len i ename ed bname
                                   atts attr-ent attsub attpt attval
                                   total pass fail pv-test alt-val expected ok
                                   label layer nb-rec nb-txt nb-pt nb-dy nb-dx
                                   nb-best-dx th)
-  (setq ent-info-list (DQC:collect-text-entities))
   (setq total 0 pass 0 fail 0)
   (setq ss (ssget "X" (list (cons 0 "INSERT"))))
   (if ss
@@ -1621,8 +1638,15 @@
 
 (defun DQC:run-dims (doc / ss len i ename res res-car total pass fail skip
                           txt pt th rec r2
-                          torque-res wt-res blk-res)
+                          text-ents blk-ents torque-res wt-res blk-res)
   (setq total 0 pass 0 fail 0 skip 0)
+  ;; Collect text entities ONCE and share across all secondary scans
+  (setq text-ents (DQC:collect-text-entities))
+  ;; Bracket-only list for block attrs nearby lookup
+  (setq blk-ents
+    (vl-remove-if-not
+      (function (lambda (r) (> (DQC:find-char (nth 1 r) "[" 1) 0)))
+      text-ents))
   (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
   (if (null ss)
     (princ "\n No dimension entities found.\n")
@@ -1644,23 +1668,23 @@
             (setq th (DQC:dim-txth ename))
             (setq rec (list ename txt pt th))
             ;; Inline inch [mm] check - ONLY if process-dim returned SKIP.
-            ;; This prevents double-ticking entities already marked above.
+            ;; Prevents double-ticking entities already marked above.
             (if (= res-car 'SKIP)
               (progn
                 (setq r2 (DQC:check-inline-mm-info rec 0 0 0))
                 (setq pass (+ pass (cadr r2))
                       fail (+ fail (caddr r2)))))))
         (setq i (1+ i)))))
-  ;; FT-LB [N-m] torque check across text entities (self-contained, no-miss=T)
-  (setq torque-res (DQC:run-mode3-torque))
+  ;; FT-LB [N-m]: pre-filtered entity list, no-miss=T prevents false positives
+  (setq torque-res (DQC:run-mode3-torque text-ents))
   (setq pass (+ pass (cadr torque-res))
         fail (+ fail (caddr torque-res)))
-  ;; LB [KG] weight check across text entities (self-contained, no-miss=T)
-  (setq wt-res (DQC:run-mode3-weight))
+  ;; LB [KG]: pre-filtered, no-miss=T
+  (setq wt-res (DQC:run-mode3-weight text-ents))
   (setq pass (+ pass (cadr wt-res))
         fail (+ fail (caddr wt-res)))
-  ;; Block attribute inch->mm scan (self-contained, skips DQC:SKIP-BLOCK-NAMES)
-  (setq blk-res (DQC:run-block-attrs doc))
+  ;; Block attrs: only pass entities that have "[" bracket (fast nearby lookup)
+  (setq blk-res (DQC:run-block-attrs doc blk-ents))
   (setq pass (+ pass (cadr blk-res))
         fail (+ fail (caddr blk-res)))
   (list total pass fail skip))
