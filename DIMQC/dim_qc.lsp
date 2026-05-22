@@ -10,7 +10,7 @@
 ;;;  MODES
 ;;;    1. Operating Conditions  - user selects text  (HP/kW, IN-LB/N-M)
 ;;;    2. MED Check             - user selects text  (LB/KG, torque, LB/IN, PSI; no RAD/compound stiffness)
-;;;    3. Dimensions Check      - all entities scanned (inch [mm] only)
+;;;    3. Dimensions Check      - dimensions + Mode 3 block/text unit pairs
 ;;;    4. Notes Check           - user selects notes (LB/KG + inch/mm)
 ;;;
 ;;;  NUMBERS WITH COMMAS AS THOUSANDS SEPARATORS ARE HANDLED.
@@ -39,6 +39,18 @@
 (setq DQC:MARK-ANCHOR T)
 (setq DQC:ANCHOR-RATIO 0.12)
 (setq DQC:LEADER-COLOR 8)
+
+;;; BLOCK CHANGE GO HERE:
+;;; Add block names to this list when their attributes should be ignored by DIMQC.
+(setq DQC:IGNORED-BLOCK-NAMES (list "KF"))
+
+;;; Metric/converted units that should normally live in square brackets in Mode 3.
+(setq DQC:COMMON-METRIC-UNITS
+  (list "MM" "KG" "N-M" "N.M" "NM" "N M" "KPA" "KW" "N/MM"))
+
+;;; Surface finish support placeholder. Recognition rules will go here once the
+;;; drawing convention is known.
+(setq DQC:SURFACE-FINISH-RULES nil)
 
 
 ;;; ============================================================================
@@ -212,6 +224,96 @@
         (or (= (strcase lay) (strcase DQC:PASS-LAYER))
             (= (strcase lay) (strcase DQC:FAIL-LAYER)))))))
 
+(defun DQC:safearray-list (value / variantRes res)
+  (cond
+    ((listp value) value)
+    (value
+     (setq variantRes (vl-catch-all-apply 'vlax-variant-value (list value)))
+     (if (vl-catch-all-error-p variantRes) (setq variantRes value))
+     (setq res (vl-catch-all-apply 'vlax-safearray->list (list variantRes)))
+     (if (and (not (vl-catch-all-error-p res)) (listp res)) res nil))
+    (T nil)))
+
+(defun DQC:safearray-point (value / res)
+  (setq res (DQC:safearray-list value))
+  (if (and (listp res) (>= (length res) 2))
+    (list (car res) (cadr res) (if (caddr res) (caddr res) 0.0))
+    nil))
+
+(defun DQC:block-name (blkRef / eRes nRes)
+  (setq eRes (vl-catch-all-apply 'vla-get-EffectiveName (list blkRef)))
+  (if (and (not (vl-catch-all-error-p eRes)) (= (type eRes) 'STR))
+    eRes
+    (progn
+      (setq nRes (vl-catch-all-apply 'vla-get-Name (list blkRef)))
+      (if (and (not (vl-catch-all-error-p nRes)) (= (type nRes) 'STR)) nRes ""))))
+
+(defun DQC:ignored-block-p (blkRef / bname hit x)
+  (setq bname (strcase (DQC:block-name blkRef)) hit nil)
+  (foreach x DQC:IGNORED-BLOCK-NAMES
+    (if (= bname (strcase x)) (setq hit T)))
+  hit)
+
+(defun DQC:attr-point (att fallback / p)
+  (setq p (vl-catch-all-apply 'vlax-get (list att 'InsertionPoint)))
+  (if (and (not (vl-catch-all-error-p p)) p)
+    (DQC:safearray-point p)
+    fallback))
+
+(defun DQC:attribute-info-list (blkEname blkObj / result hasRes attRes attList att txt pt th aename)
+  (setq result nil)
+  (if (not (DQC:ignored-block-p blkObj))
+    (progn
+      (setq hasRes (vl-catch-all-apply 'vla-get-HasAttributes (list blkObj)))
+      (if (and (not (vl-catch-all-error-p hasRes)) hasRes)
+        (progn
+          (setq attRes (vl-catch-all-apply 'vla-GetAttributes (list blkObj)))
+          (if (and (not (vl-catch-all-error-p attRes)) attRes)
+            (progn
+              (setq attList (DQC:safearray-list attRes))
+              (if attList
+                (foreach att attList
+                  (setq txt (vl-catch-all-apply 'vlax-get (list att 'TextString)))
+                  (if (or (vl-catch-all-error-p txt) (null txt)) (setq txt ""))
+                  (if (> (strlen (DQC:trim txt)) 0)
+                    (progn
+                      (setq pt (DQC:attr-point att (DQC:dim-textpt blkEname)))
+                      (setq th (vl-catch-all-apply 'vlax-get (list att 'Height)))
+                      (if (or (vl-catch-all-error-p th) (null th) (< th 0.001)) (setq th (DQC:dim-txth blkEname)))
+                      (setq aename (vl-catch-all-apply 'vlax-vla-object->ename (list att)))
+                      (if (vl-catch-all-error-p aename) (setq aename blkEname))
+                      (setq result (append result (list (list aename (DQC:strip txt 0.0 0.0) pt th))))
+                    ))))))))))
+  result)
+
+(defun DQC:collect-text-info-from-ss (ss / ent-info-list len i ename ed etype obj txt pt th)
+  ;; Collects text, mtext, and block attributes. INSERT attributes are included
+  ;; unless the block name is in DQC:IGNORED-BLOCK-NAMES above.
+  (setq ent-info-list nil)
+  (if ss
+    (progn
+      (setq len (sslength ss) i 0)
+      (while (< i len)
+        (setq ename (ssname ss i))
+        (if (not (DQC:on-qc-layer? ename))
+          (progn
+            (setq ed (vl-catch-all-apply 'entget (list ename)))
+            (if (vl-catch-all-error-p ed) (setq ed nil))
+            (setq etype (if ed (strcase (cdr (assoc 0 ed))) ""))
+            (cond
+              ((wcmatch etype "MTEXT,TEXT")
+               (setq txt (DQC:strip (DQC:get-text ename) 0.0 0.0))
+               (setq pt  (DQC:dim-textpt ename))
+               (setq th  (DQC:dim-txth ename))
+               (setq ent-info-list (append ent-info-list (list (list ename txt pt th)))))
+              ((= etype "INSERT")
+               (setq obj (vl-catch-all-apply 'vlax-ename->vla-object (list ename)))
+               (if (not (vl-catch-all-error-p obj))
+                 (setq ent-info-list
+                   (append ent-info-list (DQC:attribute-info-list ename obj))))))))
+        (setq i (1+ i)))))
+  ent-info-list)
+
 
 ;;; ============================================================================
 ;;;  PART 2 - MTEXT FORMAT-CODE STRIPPER
@@ -357,6 +459,34 @@
         (if (or (null lo) (= (strlen lo) 0))
           (strcat " " hi)
           (strcat " " hi "/" lo))))))
+
+(defun DQC:tol-token-val (s / ss)
+  (if (or (null s) (/= (type s) 'STR))
+    nil
+    (progn
+      (setq ss (DQC:trim s))
+      (if (or (= ss "") (= ss "+") (= ss "-"))
+        nil
+        (abs (DQC:atof-safe ss))))))
+
+(defun DQC:tol-pair-ok? (in-tol mm-tol / ih il mh ml tol-hi tol-lo)
+  ;; If either side shows tolerances, both sides must show matching converted
+  ;; high/low tolerance values.
+  (cond
+    ((and (null in-tol) (null mm-tol)) T)
+    ((or (null in-tol) (null mm-tol)) nil)
+    (T
+     (setq ih (DQC:tol-token-val (car in-tol))
+           il (DQC:tol-token-val (cadr in-tol))
+           mh (DQC:tol-token-val (car mm-tol))
+           ml (DQC:tol-token-val (cadr mm-tol)))
+     (if (and ih il mh ml)
+       (progn
+         (setq tol-hi (DQC:rounding-tol (car mm-tol))
+               tol-lo (DQC:rounding-tol (cadr mm-tol)))
+         (and (<= (abs (- (* ih DQC:MM/IN) mh)) tol-hi)
+              (<= (abs (- (* il DQC:MM/IN) ml)) tol-lo)))
+       nil))))
 
 
 ;;; ============================================================================
@@ -642,6 +772,19 @@
         dy (- (cadr p1) (cadr p2)))
   (sqrt (+ (* dx dx) (* dy dy))))
 
+(defun DQC:near-value-candidate-p (basePt otherPt th / dx dy lim)
+  ;; For block/table values, converted values are often to the right, below,
+  ;; or above the primary value. This keeps the search local but not one-directional.
+  (if (and basePt otherPt th)
+    (progn
+      (setq dx (- (car otherPt) (car basePt))
+            dy (- (cadr otherPt) (cadr basePt))
+            lim (* th 1.4))
+      (or
+        (and (> dx 0.0) (<= (abs dy) lim))
+        (and (<= (abs dx) (* th 3.0)) (> (abs dy) 0.0) (<= (abs dy) (* th 4.0)))))
+    nil))
+
 ;;; Text/MText rotation helper for accurate inline note hit anchors.
 (defun DQC:text-rotation (ename / ed obj r)
   (setq ed (vl-catch-all-apply 'entget (list ename)))
@@ -868,6 +1011,41 @@
               (if (and left-ok right-ok)
                 (setq found T))))))))
   found)
+
+(defun DQC:mode3-unit-rules (/)
+  (list
+    (list (list "FT-LB" "FT LB" "FT.LB" "FTLB")
+          (list "N-M" "N.M" "NM" "N M") 1.355818 "FT-LB" "N-M" 1 2)
+    (list (list "IN-LB" "IN.LB" "IN LB" "INLB")
+          (list "N-M" "N.M" "NM" "N M") 0.112985 "IN-LB" "N-M" 0 2)
+    (list (list "LBS" "LB") (list "KG") 0.453592 "LB" "KG" 1 2)
+    (list (list "PSI") (list "KPA") 6.89476 "PSI" "kPa" 0 1)))
+
+(defun DQC:has-common-metric-unit? (txt / found kw)
+  (setq found nil)
+  (foreach kw DQC:COMMON-METRIC-UNITS
+    (if (and (not found) (DQC:unit-text-has? txt (list kw)))
+      (setq found T)))
+  found)
+
+(defun DQC:has-square-brackets? (txt /)
+  (and (vl-string-search "[" txt) (vl-string-search "]" txt)))
+
+(defun DQC:check-missing-brackets-info (ent-info-list / total fail rec ename txt pt th label)
+  ;; Redundant warning: catches likely converted metric values that are present
+  ;; without square brackets. Not foolproof, intentionally manual-review style.
+  (setq total 0 fail 0)
+  (foreach rec ent-info-list
+    (setq ename (nth 0 rec)
+          txt   (nth 1 rec)
+          pt    (nth 2 rec)
+          th    (nth 3 rec))
+    (if (and txt (DQC:has-common-metric-unit? txt) (not (DQC:has-square-brackets? txt)))
+      (progn
+        (setq label (DQC:fail-label "?? metric unit missing []"))
+        (DQC:place-balloon pt th 0.0 label DQC:FAIL-LAYER)
+        (setq total (1+ total) fail (1+ fail)))))
+  (list total 0 fail))
 ;;; ============================================================================
 ;;;  PART 9 - CROSS-ENTITY UNIT-PAIR MATCHER
 ;;;
@@ -1015,7 +1193,7 @@
                                  hits hit pv alt-val expected ok label layer
                                  unit-rec unit-pt unit-txt
                                  alt-rec alt-pt alt-txt
-                                 dx dy dx2 best-dx
+                                 dx dy dx2 sep best-dx
                                  nb-rec nb-txt nb-pt nb-dy nb-dx
                                  nb-best-dx _nb-alt)
   (setq total 0 pass 0 fail 0)
@@ -1058,8 +1236,9 @@
                 (setq dy (abs (- (cadr unit-pt) (cadr pt)))
                       dx (- (car unit-pt) (car pt)))
 
-                (if (and (> dx 0.0) (<= dy (* th 1.1)))
+                (if (DQC:near-value-candidate-p pt unit-pt th)
                   (progn
+                    (setq sep (DQC:dist2d pt unit-pt))
                     ;; Unit contains alt
                     (setq alt-val (DQC:find-alt-in-string unit-txt altl 1))
 
@@ -1074,12 +1253,12 @@
                           (progn
                             (setq dy (abs (- (cadr alt-pt) (cadr unit-pt)))
                                   dx2 (- (car alt-pt) (car unit-pt)))
-                            (if (and (> dx2 0.0) (<= dy (* th 1.1)) (null alt-val))
+                            (if (and (DQC:near-value-candidate-p unit-pt alt-pt th) (null alt-val))
                               (setq alt-val
                                     (DQC:find-alt-in-string alt-txt altl 1)))))))
 
-                    (if (and alt-val (< dx best-dx))
-                      (setq best-dx dx
+                    (if (and alt-val (< sep best-dx))
+                      (setq best-dx sep
                             hits (list (list pv 1 0 (car kwl))))))))))))
 
       ;; Evaluate
@@ -1100,11 +1279,12 @@
                 (progn
                   (setq nb-dy (abs (- (cadr nb-pt) (cadr pt)))
                         nb-dx (- (car nb-pt) (car pt)))
-                  (if (and (> nb-dx 0.0) (<= nb-dy (* th 1.2)) (< nb-dx nb-best-dx))
+                  (if (and (DQC:near-value-candidate-p pt nb-pt th)
+                           (< (DQC:dist2d pt nb-pt) nb-best-dx))
                     (progn
                       (setq _nb-alt (DQC:find-alt-in-string nb-txt altl 1))
                       (if _nb-alt
-                        (setq nb-best-dx nb-dx
+                        (setq nb-best-dx (DQC:dist2d pt nb-pt)
                               alt-val _nb-alt)))))))))
 
         (if alt-val
@@ -1138,31 +1318,21 @@
 ;;;  PART 10 - MODE 1: OPERATING CONDITIONS CHECK
 ;;; ============================================================================
 
-(defun DQC:run-opcond (doc / ss ent-info-list i len ename txt pt th res
+(defun DQC:run-opcond (doc / ss ent-info-list res
                              rules total pass fail)
-  (princ "\n Select ALL Operating Conditions text lines (window or pick), ENTER when done:")
-  (setq ss (ssget '((0 . "MTEXT,TEXT"))))
+  (princ "\n Select ALL Operating Conditions text/block lines (window or pick), ENTER when done:")
+  (setq ss (ssget '((0 . "MTEXT,TEXT,INSERT"))))
   (if (null ss)
     (progn (princ "\n Nothing selected.\n") (list 0 0 0 0))
     (progn
-      (setq ent-info-list nil len (sslength ss) i 0)
-      (while (< i len)
-        (setq ename (ssname ss i))
-        (if (not (DQC:on-qc-layer? ename))
-          (progn
-            (setq txt (DQC:get-text ename))
-            (setq pt  (DQC:dim-textpt ename))
-            (setq th  (DQC:dim-txth ename))
-            (setq ent-info-list
-                  (append ent-info-list (list (list ename txt pt th))))))
-        (setq i (1+ i)))
+      (setq ent-info-list (DQC:collect-text-info-from-ss ss))
       (setq rules
         (list
-          ;; HP -> kW  (tol=5.0 for OP: only unit-digit rounding matters)
-          (list (list "HP") (list "KW") 0.7457 "HP" "kW" 1 2 5.0)
-          ;; IN-LB -> N-M  (tol=5.0 for OP)
+          ;; HP -> kW. OP labels round calculated values to whole units.
+          (list (list "HP") (list "KW") 0.7457 "HP" "kW" 0 0 0.5)
+          ;; IN-LB -> N-M. OP labels round calculated values to whole units.
           (list (list "IN-LB" "IN.LB" "IN LB" "INLB")
-                (list "N-M" "N.M" "NM" "N M") 0.112985 "IN-LB" "N-M" 0 2 5.0)))
+                (list "N-M" "N.M" "NM" "N M") 0.112985 "IN-LB" "N-M" 0 0 0.5)))
       (setq res (DQC:match-cross-entity ent-info-list rules))
       (list (car res) (cadr res) (caddr res) 0))))
 
@@ -1196,11 +1366,12 @@
             (progn
               (setq nb-dy (abs (- (cadr nb-pt) (cadr pt)))
                     nb-dx (- (car nb-pt) (car pt)))
-              (if (and (> nb-dx 0.0) (<= nb-dy (* th 1.2)) (< nb-dx nb-best-dx))
+              (if (and (DQC:near-value-candidate-p pt nb-pt th)
+                       (< (DQC:dist2d pt nb-pt) nb-best-dx))
                 (progn
                   (setq _nb-alt (DQC:extract-bracket-number nb-txt))
                   (if _nb-alt
-                    (setq nb-best-dx nb-dx
+                    (setq nb-best-dx (DQC:dist2d pt nb-pt)
                           alt-val _nb-alt)))))))
         (if alt-val
           (progn
@@ -1221,24 +1392,66 @@
                 (DQC:place-balloon pt th 0.0 label layer))))))))
   (list total pass fail))
 
-(defun DQC:run-med (doc / ss ent-info-list i len ename txt pt th res rec
+(defun DQC:mode3-cross-inch-mm (primary-info-list compare-info-list
+                                  / total pass fail
+                                    rec ename txt pt th pv
+                                    nb-rec nb-txt nb-pt nb-dy nb-dx
+                                    nb-best-dx _nb-alt
+                                    alt-val expected ok label layer df)
+  ;; Mode 3 block/table inch[mm] check. Primary values come only from real
+  ;; text/block attributes; nearby generated dimension records are comparison
+  ;; targets only, so they cannot create duplicate primary checks.
+  (setq total 0 pass 0 fail 0)
+  (foreach rec primary-info-list
+    (setq ename (nth 0 rec)
+          txt   (nth 1 rec)
+          pt    (nth 2 rec)
+          th    (nth 3 rec))
+    (setq pv (DQC:number-only-text txt))
+    (if (and pv pt (> pv 0.0))
+      (progn
+        (setq alt-val nil nb-best-dx 1e99)
+        (foreach nb-rec compare-info-list
+          (setq nb-txt (nth 1 nb-rec)
+                nb-pt  (nth 2 nb-rec))
+          (if (and nb-pt
+                   (not (eq (nth 0 nb-rec) ename)))
+            (progn
+              (setq nb-dy (abs (- (cadr nb-pt) (cadr pt)))
+                    nb-dx (- (car nb-pt) (car pt)))
+              (if (and (DQC:near-value-candidate-p pt nb-pt th)
+                       (< (DQC:dist2d pt nb-pt) nb-best-dx))
+                (progn
+                  (setq _nb-alt (DQC:extract-bracket-number nb-txt))
+                  (if _nb-alt
+                    (setq nb-best-dx (DQC:dist2d pt nb-pt)
+                          alt-val _nb-alt)))))))
+        (if alt-val
+          (progn
+            (setq expected (* pv DQC:MM/IN)
+                  df (abs (- expected (abs alt-val))))
+            (if (< df (* expected 0.2))
+              (progn
+                (setq ok (<= df 0.5) total (1+ total))
+                (if ok
+                  (setq pass (1+ pass) label (DQC:pass-label) layer DQC:PASS-LAYER)
+                  (setq fail (1+ fail)
+                        label (DQC:fail-label
+                                (strcat "\\U+2717 " (rtos pv 2 3) " IN ["
+                                        (rtos alt-val 2 1) "] exp "
+                                        (rtos expected 2 1) " MM"))
+                        layer DQC:FAIL-LAYER))
+                (DQC:place-balloon pt th 0.0 label layer))))))))
+  (list total pass fail))
+
+(defun DQC:run-med (doc / ss ent-info-list res rec
                           rules total pass fail r2 r3)
-  (princ "\n Select ALL MED data text lines (window or pick), ENTER when done:")
-  (setq ss (ssget '((0 . "MTEXT,TEXT"))))
+  (princ "\n Select ALL MED data text/block lines (window or pick), ENTER when done:")
+  (setq ss (ssget '((0 . "MTEXT,TEXT,INSERT"))))
   (if (null ss)
     (progn (princ "\n Nothing selected.\n") (list 0 0 0 0))
     (progn
-      (setq ent-info-list nil len (sslength ss) i 0)
-      (while (< i len)
-        (setq ename (ssname ss i))
-        (if (not (DQC:on-qc-layer? ename))
-          (progn
-            (setq txt (DQC:strip (DQC:get-text ename) 0.0 0.0))
-            (setq pt  (DQC:dim-textpt ename))
-            (setq th  (DQC:dim-txth ename))
-            (setq ent-info-list
-                  (append ent-info-list (list (list ename txt pt th))))))
-        (setq i (1+ i)))
+      (setq ent-info-list (DQC:collect-text-info-from-ss ss))
 
       ;; MED rules with RAD/DEG/compound stiffness detection removed.
       ;; Compound-unit false hits are blocked by DQC:find-prim-hits and DQC:unit-text-has?.
@@ -1287,7 +1500,7 @@
                               pair stripped raw from-text from-meas-sub
                               pfx in-dp mm-dp style-dp bracket-pos inch-seg
                               primary alt expected ok label layer
-                              in-tol mm-tol tol-str txtpt txth dimang
+                              in-tol mm-tol tol-ok tol-str txtpt txth dimang
                               range-data r-lo r-hi r-mlo r-mhi r-ok-lo r-ok-hi)
   (setq obj (vl-catch-all-apply 'vlax-ename->vla-object (list ename)))
   (if (vl-catch-all-error-p obj)
@@ -1372,6 +1585,7 @@
               (setq mm-dp (if (= in-dp 0) 0 (max 1 (1- in-dp))))
               (setq in-tol (if pair (nth 2 pair) nil))
               (setq mm-tol (if pair (nth 3 pair) nil))
+              (setq tol-ok (DQC:tol-pair-ok? in-tol mm-tol))
               (setq tol-str
                 (if (or in-tol mm-tol)
                   (strcat " [" (DQC:fmt-tol in-tol) " | " (DQC:fmt-tol mm-tol) "]") ""))
@@ -1406,7 +1620,14 @@
                   (DQC:place-balloon txtpt txth dimang label layer)
                   (list (if ok 'PASS 'FAIL) label r-lo r-mlo (* r-lo DQC:MM/IN) raw))
                 (cond
-                  ((null pair) (list 'SKIP "" nil nil nil raw))
+                  ((null pair)
+                   (if is-dim
+                     (progn
+                       (setq label (DQC:fail-label "?? verify conversion")
+                             layer DQC:FAIL-LAYER)
+                       (DQC:place-balloon txtpt txth dimang label layer)
+                       (list 'FAIL label nil nil nil raw))
+                     (list 'SKIP "" nil nil nil raw)))
                   ((eq (cadr pair) 'EMPTY)
                    (setq primary  (car pair)
                          expected (* (abs primary) DQC:MM/IN)
@@ -1420,13 +1641,14 @@
                    (setq primary  (car pair)
                          alt      (cadr pair)
                          expected (* (abs primary) DQC:MM/IN)
-                         ok       (DQC:ok? primary alt DQC:MM/IN))
+                         ok       (and (DQC:ok? primary alt DQC:MM/IN) tol-ok))
                    (if ok
                      (setq label (DQC:pass-label) layer DQC:PASS-LAYER)
                      (setq label (DQC:fail-label
                                    (strcat "\\U+2717 " pfx (DQC:fmt primary in-dp)
                                            " [" (DQC:fmt alt mm-dp) "] exp "
-                                           (DQC:fmt expected mm-dp) " mm" tol-str))
+                                           (DQC:fmt expected mm-dp) " mm" tol-str
+                                           (if tol-ok "" " tol?")))
                            layer DQC:FAIL-LAYER))
                    (DQC:place-balloon txtpt txth dimang label layer)
                    (list (if ok 'PASS 'FAIL) label primary alt expected raw)))))))))))
@@ -1516,13 +1738,47 @@
              (DQC:place-balloon pt th 0.0 label layer)))))))
   (list total pass fail))
 
+(defun DQC:dim-mode3-info (ename doc / ed etype meas sname lfac primary-auto
+                                  dimaltf pt th txt)
+  ;; Synthetic nearby-value record for real dimensions. This lets a block
+  ;; attribute primary inch value use a nearby AutoCAD dimension as the [mm]
+  ;; comparison source without re-running the full dimension check.
+  (setq ed (vl-catch-all-apply 'entget (list ename)))
+  (if (vl-catch-all-error-p ed) (setq ed nil))
+  (if (or (null ed) (DQC:on-qc-layer? ename))
+    nil
+    (progn
+      (setq etype (strcase (cdr (assoc 0 ed))))
+      (if (not (wcmatch etype
+                 "DIMENSION,ROTATED*,LINEAR*,ALIGNED*,ANG*,DIAMETR*,RADIAL*,ORDINATE*"))
+        nil
+        (progn
+          (setq meas (cdr (assoc 42 ed)))
+          (if (null meas) (setq meas 0.0))
+          (setq sname (DQC:dim-style ename)
+                lfac (DQC:lfac sname doc)
+                primary-auto (* (abs meas) lfac)
+                dimaltf (cdr (assoc 143 ed)))
+          (if (or (null dimaltf) (zerop dimaltf)) (setq dimaltf DQC:MM/IN))
+          (if (<= primary-auto 0.0001)
+            nil
+            (progn
+              (setq pt (DQC:dim-textpt ename)
+                    th (DQC:dim-txth ename)
+                    txt (strcat (rtos primary-auto 2 6)
+                                " [" (rtos (* primary-auto dimaltf) 2 6) "]"))
+              (if (and pt th) (list ename txt pt th) nil))))))))
+
 (defun DQC:run-dims (doc / ss len i ename ed etype res total pass fail skip
-                           txt pt th rec r2)
+                           txt pt th rec r2 r3 r4 text-info-list dim-info-list
+                           cross-info-list dim-rec)
   (setq total 0 pass 0 fail 0 skip 0)
-  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT"))))
+  (setq ss (ssget "X" (list (cons 0 "DIMENSION,MULTILEADER,LEADER,MTEXT,TEXT,INSERT"))))
   (if (null ss)
     (princ "\n No dimension entities found.\n")
     (progn
+      (setq text-info-list (DQC:collect-text-info-from-ss ss)
+            dim-info-list nil)
       (setq len (sslength ss) i 0)
       (while (< i len)
         (setq ename (ssname ss i))
@@ -1531,20 +1787,11 @@
             (setq ed (vl-catch-all-apply 'entget (list ename)))
             (if (vl-catch-all-error-p ed) (setq ed nil))
             (setq etype (if ed (strcase (cdr (assoc 0 ed))) ""))
-            (if (wcmatch etype "MTEXT,TEXT")
+            (if (wcmatch etype "MTEXT,TEXT,INSERT")
               (progn
-                ;; Text/MText can contain multiple inline checks. Count actual
-                ;; checks, not the parent entity, and do not run process-dim on
-                ;; the same text again.
-                (setq txt (DQC:strip (DQC:get-text ename) 0.0 0.0))
-                (setq pt (DQC:dim-textpt ename))
-                (setq th (DQC:dim-txth ename))
-                (setq rec (list ename txt pt th))
-                (setq r2 (DQC:check-inline-mm-info rec 0 0 0))
-                (setq total (+ total (car r2))
-                      pass  (+ pass  (cadr r2))
-                      fail  (+ fail  (caddr r2)))
-                (if (= (car r2) 0) (setq skip (1+ skip)))
+                ;; Text, MTEXT, and block attributes are handled as grouped
+                ;; Mode 3 text records after all real dimensions are processed.
+                nil
               )
               (progn
                 (setq res (DQC:process-dim ename doc))
@@ -1552,9 +1799,42 @@
                   ((= (car res) 'PASS) (setq total (1+ total) pass (1+ pass)))
                   ((= (car res) 'FAIL) (setq total (1+ total) fail (1+ fail)))
                   (T (setq skip (1+ skip))))
+                (setq dim-rec (DQC:dim-mode3-info ename doc))
+                (if dim-rec (setq dim-info-list (append dim-info-list (list dim-rec))))
+                ;; Redundant check for dimension text that contains metric units
+                ;; but is not bracketed. Blank automatic dimensions are ignored.
+                (setq txt (DQC:strip (DQC:get-text ename) nil nil))
+                (if (> (strlen (DQC:trim txt)) 0)
+                  (progn
+                    (setq rec (list ename txt (DQC:dim-textpt ename) (DQC:dim-txth ename)))
+                    (setq r4 (DQC:check-missing-brackets-info (list rec)))
+                    (setq total (+ total (car r4))
+                          pass  (+ pass  (cadr r4))
+                          fail  (+ fail  (caddr r4)))))
               )
             )))
         (setq i (1+ i)))))
+  ;; Mode 3 text/block pass: inline inch[mm], split block/table values, and
+  ;; nearby lb/kg, ft-lb/N-m, in-lb/N-m, psi/kPa checks.
+  (foreach rec text-info-list
+    (setq r2 (DQC:check-inline-mm-info rec 0 0 0))
+    (setq total (+ total (car r2))
+          pass  (+ pass  (cadr r2))
+          fail  (+ fail  (caddr r2))))
+  (setq cross-info-list (append text-info-list dim-info-list))
+  (setq r3 (DQC:match-cross-entity text-info-list (DQC:mode3-unit-rules)))
+  (setq total (+ total (car r3))
+        pass  (+ pass  (cadr r3))
+        fail  (+ fail  (caddr r3)))
+  ;; Block/table case: primary inch value in one attribute and [mm] value nearby.
+  (setq r3 (DQC:mode3-cross-inch-mm text-info-list cross-info-list))
+  (setq total (+ total (car r3))
+        pass  (+ pass  (cadr r3))
+        fail  (+ fail  (caddr r3)))
+  (setq r4 (DQC:check-missing-brackets-info text-info-list))
+  (setq total (+ total (car r4))
+        pass  (+ pass  (cadr r4))
+        fail  (+ fail  (caddr r4)))
   (list total pass fail skip))
 
 
@@ -1562,24 +1842,14 @@
 ;;;  PART 13 - MODE 4: NOTES CHECK
 ;;; ============================================================================
 
-(defun DQC:run-notes (doc / ss ent-info-list i len ename txt pt th res
+(defun DQC:run-notes (doc / ss ent-info-list res
                             rules total pass fail r2 rec)
-  (princ "\n Select ALL Notes text lines (window or pick), ENTER when done:")
-  (setq ss (ssget '((0 . "MTEXT,TEXT"))))
+  (princ "\n Select ALL Notes text/block lines (window or pick), ENTER when done:")
+  (setq ss (ssget '((0 . "MTEXT,TEXT,INSERT"))))
   (if (null ss)
     (progn (princ "\n Nothing selected.\n") (list 0 0 0 0))
     (progn
-      (setq ent-info-list nil len (sslength ss) i 0)
-      (while (< i len)
-        (setq ename (ssname ss i))
-        (if (not (DQC:on-qc-layer? ename))
-          (progn
-            (setq txt (DQC:strip (DQC:get-text ename) 0.0 0.0))
-            (setq pt  (DQC:dim-textpt ename))
-            (setq th  (DQC:dim-txth ename))
-            (setq ent-info-list
-                  (append ent-info-list (list (list ename txt pt th))))))
-        (setq i (1+ i)))
+      (setq ent-info-list (DQC:collect-text-info-from-ss ss))
       (setq rules
         (list
           ;; Weight: LB -> KG
@@ -1672,7 +1942,7 @@
        (princ "\n Running MED Check...\n")
        (setq result (DQC:run-med doc)))
       ((= mode 3)
-       (princ "\n Running Dimensions Check (inch [mm])...\n")
+       (princ "\n Running Dimensions Check (dimensions + Mode 3 unit pairs)...\n")
        (setq result (DQC:run-dims doc)))
       ((= mode 4)
        (princ "\n Running Notes Check...\n")
@@ -1798,7 +2068,7 @@
 (princ "     1 = Operating Conditions (HP/kW, IN-LB/N-M)\n")
 (princ "     2 = MED Check (LB/KG, torque, LB/IN, PSI; no RAD/compound stiffness)\n")
 (princ "                  x10^N values: coefficient-only comparison\n")
-(princ "     3 = Dimensions Check (inch [mm]) - all entities\n")
+(princ "     3 = Dimensions Check - dimensions + Mode 3 unit pairs\n")
 (princ "     4 = Notes Check (LB/KG + inch/mm)\n")
 (princ "   DIMQC-RESET  Remove marks + delete QC layers\n")
 (princ "   DIMQC-DIAG   Command-line diagnostic\n")
