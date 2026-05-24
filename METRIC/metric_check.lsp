@@ -1,39 +1,44 @@
 ;;; =====================================================================
-;;; METRIC_CHECK.LSP  v15.0-CANONICAL-PRO
+;;; METRIC_CHECK.LSP  v16.0-CANONICAL-PRO
 ;;; Commands: METRIC_CHECK / METRIC_CLEAR
 ;;;
-;;; Professional build based on v14.2 + category patch, with these fixes:
+;;; Professional build based on v15.0. v16.0 improvements:
 ;;;
-;;;   1. Inch source DWG is read through ObjectDBX when available, so it does
-;;;      NOT open as a visible drawing tab/window. If ObjectDBX is unavailable,
-;;;      the code falls back to read-only vla-open and closes it automatically.
+;;;   1. mc:strip-mtext now correctly handles ALL MTEXT escape sequences:
+;;;        \S...;  stacked fractions → space (prevents tolerance numbers
+;;;                from leaking into dimensional extraction)
+;;;        \f/H/A/C/W/Q/T...;  format codes → skipped entirely
+;;;        \U+XXXX  Unicode sequences → space
+;;;        \L/O/K   toggle codes → skipped
+;;;      Previously \S...;  leaked "+.004^-.000;" into the output,
+;;;      causing false positive/negative matches on toleranced dims.
 ;;;
-;;;   2. Ignored block names/effective names:
-;;;        C, REVSYMB, REVC
-;;;      Attributes inside these blocks are never read or checked.
+;;;   2. MULTILEADER (AcDbMLeader) entities now use mc:add-mleader-text
+;;;      which reads TextLocation (annotation position) not InsertionPoint
+;;;      (which returns the arrowhead tip). MTEXT format codes are stripped.
 ;;;
-;;;   3. Text/attribute matching is category-safe:
-;;;        DIA/RAD/DIM/TOL are not cross-paired.
-;;;      Example fixed:
-;;;        .771 diameter will not match .03 FCF/tolerance.
+;;;   3. Ignored block list expanded:
+;;;        C, REVSYMB, REVC, REVTRI, REVCIRCLE, TITLEBLOCK, BORDER,
+;;;        TB, TITLE, REVISION, REVCLOUD, FRAME
 ;;;
-;;;   4. Text/attribute result states are strict:
-;;;        FOUND + correct = green tick only
-;;;        FOUND + wrong   = white exp/got error
-;;;        NOT FOUND       = white ??
-;;;      A wrong found attribute will not become a separate inch ?? plus metric ??.
+;;;   4. mc:ignored-block-p uses vl-some (short-circuit) for speed.
 ;;;
-;;;   5. Random title/sheet/revision numbers are filtered out by:
-;;;        - ignored block names
-;;;        - dimension-like text rules
-;;;        - text category rules
+;;;   5. Dead code removed: mc:find-best-dim-match, mc:find-best-text-match,
+;;;      mc:find-nearest-text-match (all superseded by global-assignment).
 ;;;
-;;;   6. Dimensions still use displayed override first, measurement fallback.
+;;;   6. Progress indicators added: matching phases print counts as they go.
+;;;
+;;;   7. Inch source DWG read through ObjectDBX (no visible window).
+;;;      Fallback: read-only vla-open (auto-closed).
+;;;
+;;;   8. Global dimension + text assignment: order-independent matching.
+;;;
+;;;   9. Category-safe matching: DIA/RAD/DIM/TOL not cross-paired.
 ;;;
 ;;; Conversion:
 ;;;   expected metric = inch displayed value * 25.4
 ;;; Tolerance:
-;;;   +/- 0.1 mm
+;;;   +/- 0.1 mm (text/dim nominal)
 ;;; =====================================================================
 
 (vl-load-com)
@@ -49,7 +54,9 @@
 (setq *mc-max-metric-text-value* 25000.0)
 (setq *mc-position-weight-pass* 0.001)
 (setq *mc-position-weight-fail* 0.000001)
-(setq *mc-ignored-block-names* (list "C" "REVSYMB" "REVC"))
+(setq *mc-ignored-block-names*
+  (list "C" "REVSYMB" "REVC" "REVTRI" "REVCIRCLE" "TITLEBLOCK" "BORDER"
+        "TB" "TITLE" "REVISION" "REVCLOUD" "FRAME"))
 (setq *mc-active-inch-doc* nil)
 (setq *mc-active-inch-dbx* nil)
 
@@ -225,18 +232,20 @@
   )
 )
 
-(defun mc:ignored-block-p (blkRef / bname hit x)
-  (setq bname (strcase (mc:block-name blkRef)) hit nil)
-  (foreach x *mc-ignored-block-names*
-    (if (= bname (strcase x)) (setq hit T))
-  )
-  hit
+(defun mc:ignored-block-p (blkRef / bname)
+  ;; wcmatch is a native C-level call — far faster than any LISP loop.
+  (setq bname (strcase (mc:block-name blkRef)))
+  (wcmatch bname "C,REVSYMB,REVC,REVTRI,REVCIRCLE,TITLEBLOCK,BORDER,TB,TITLE,REVISION,REVCLOUD,FRAME")
 )
 
 ;;; -------------------------------------------------------------------
 ;;; MTEXT cleanup and numeric extraction
 ;;; -------------------------------------------------------------------
-(defun mc:strip-mtext (s / res i len c nc depth skipSemi)
+(defun mc:strip-mtext (s / res i len c nc depth skipSemi sc)
+  ;; Converts MTEXT formatted string to plain text.
+  ;; Handles: \P \N \~ (newlines/space), \S...;  (stacked fractions→space),
+  ;;          \f\H\A\C\W\Q\T...;  (format codes→skip), \U+XXXX (Unicode→space),
+  ;;          \L\O\K (toggles→skip), {\\code; ...} brace-groups, %%X codes.
   (setq res "" len (strlen s) i 1 depth 0 skipSemi nil)
   (while (<= i len)
     (setq c (substr s i 1))
@@ -254,9 +263,33 @@
       ((= c "\\")
        (if (<= (1+ i) len)
          (progn
-           (setq nc (substr s (1+ i) 1))
-           (if (wcmatch nc "PpNn~") (setq res (strcat res " ")))
-           (setq i (1+ i))
+           (setq nc (strcase (substr s (1+ i) 1)))
+           (cond
+             ;; Newline / non-breaking space → space
+             ((wcmatch nc "P,N,~")
+              (setq res (strcat res " ") i (1+ i)))
+             ;; Stacked fraction \S...; → output space, skip to ;
+             ((= nc "S")
+              (setq sc (+ i 2))
+              (while (and (<= sc len) (/= (substr s sc 1) ";")) (setq sc (1+ sc)))
+              (setq res (strcat res " ") i sc))
+             ;; Format codes with ; terminator: \f \H \A \C \W \Q \T → skip to ;
+             ((wcmatch nc "F,H,A,C,W,Q,T")
+              (setq sc (+ i 2))
+              (while (and (<= sc len) (/= (substr s sc 1) ";")) (setq sc (1+ sc)))
+              (setq i sc))
+             ;; Unicode \U+XXXX → space (6 chars: \U+XXXX)
+             ((and (= nc "U") (<= (+ i 2) len) (= (substr s (+ i 2) 1) "+"))
+              (setq res (strcat res " ") i (+ i 6)))
+             ;; Toggle codes \L \O \K → just skip the 2 chars
+             ((wcmatch nc "L,O,K,X")
+              (setq i (1+ i)))
+             ;; Backslash escape \\
+             ((= nc "\\")
+              (setq res (strcat res "\\") i (1+ i)))
+             ;; Unknown: skip the backslash, let next char be processed
+             (T nil)
+           )
          )
        )
       )
@@ -506,10 +539,13 @@
     )
   )
 )
-(defun mc:get-dims (doc / ms cnt i obj oname dimVal pos result)
-  (setq result nil ms (vla-get-ModelSpace doc) cnt (vla-get-Count ms) i 0)
-  (while (< i cnt)
-    (setq obj (vla-item ms i) oname (vla-get-ObjectName obj))
+(defun mc:get-dims (doc / ms obj oname dimVal pos result)
+  ;; vlax-for uses the COM enumerator (O(n)) — vla-item is O(n) per call
+  ;; so a while/vla-item loop is O(n²). vlax-for is dramatically faster on
+  ;; large drawings.
+  (setq result nil ms (vla-get-ModelSpace doc))
+  (vlax-for obj ms
+    (setq oname (vla-get-ObjectName obj))
     (if (mc:linear-dim-p oname)
       (progn
         (setq dimVal (mc:get-dim-value obj))
@@ -519,7 +555,6 @@
         )
       )
     )
-    (setq i (1+ i))
   )
   result
 )
@@ -538,17 +573,41 @@
   )
 )
 (defun mc:add-textlike-object (obj result / oname txtRes pos txt)
+  ;; Collect a text-bearing entity (TEXT, MTEXT, ATTRIB, ATTDEF).
+  ;; Strip MTEXT format codes for MText objects.
   (setq oname (vla-get-ObjectName obj))
   (setq txtRes (vl-catch-all-apply 'vla-get-TextString (list obj)))
   (setq pos (mc:get-object-insertion-xy obj))
   (if (and (not (vl-catch-all-error-p txtRes)) (= (type txtRes) 'STR) (mc:xy-p pos))
     (progn
       (setq txt txtRes)
-      (if (wcmatch oname "AcDbMText") (setq txt (mc:strip-mtext txt)))
+      ;; Strip MTEXT formatting codes from MText and MLeader content
+      (if (wcmatch oname "AcDbMText,AcDbMLeader") (setq txt (mc:strip-mtext txt)))
       (cons (list txt pos) result)
     )
     result
   )
+)
+(defun mc:add-mleader-text (obj result / txtRes locRes pos txt)
+  ;; MLeader-specific collector: tries TextString + TextLocation.
+  ;; InsertionPoint on AcDbMLeader returns the arrowhead tip, not the
+  ;; annotation position, so we explicitly request TextLocation.
+  (setq txtRes (vl-catch-all-apply 'vla-get-TextString (list obj)))
+  (setq locRes (vl-catch-all-apply 'vla-get-TextLocation (list obj)))
+  (if (and (not (vl-catch-all-error-p txtRes))
+           (= (type txtRes) 'STR)
+           (not (vl-catch-all-error-p locRes)))
+    (progn
+      (setq pos (vl-catch-all-apply 'vlax-safearray->list (list (vlax-variant-value locRes))))
+      (if (and (not (vl-catch-all-error-p pos)) (mc:xy-p pos))
+        (progn
+          (setq txt (mc:strip-mtext txtRes))
+          (setq result (cons (list txt (list (car pos) (cadr pos))) result))
+        )
+      )
+    )
+  )
+  result
 )
 (defun mc:add-block-attributes (blkRef result / hasRes attRes attList att)
   (if (mc:ignored-block-p blkRef)
@@ -572,19 +631,26 @@
     )
   )
 )
-(defun mc:get-texts (doc / ms cnt i obj oname result)
-  (setq result nil ms (vla-get-ModelSpace doc) cnt (vla-get-Count ms) i 0)
-  (while (< i cnt)
-    (setq obj (vla-item ms i) oname (vla-get-ObjectName obj))
+(defun mc:get-texts (doc / ms obj oname result)
+  ;; vlax-for uses the COM enumerator (O(n)) — vla-item is O(n) per call
+  ;; so a while/vla-item loop is O(n²). vlax-for is dramatically faster on
+  ;; large drawings.
+  (setq result nil ms (vla-get-ModelSpace doc))
+  (vlax-for obj ms
+    (setq oname (vla-get-ObjectName obj))
     (cond
-      ((or (wcmatch oname "AcDbText") (wcmatch oname "AcDbMText") (wcmatch oname "AcDbAttribute") (wcmatch oname "AcDbAttributeDefinition"))
+      ((wcmatch oname "AcDbText,AcDbMText,AcDbAttribute,AcDbAttributeDefinition")
        (setq result (mc:add-textlike-object obj result))
       )
       ((wcmatch oname "AcDbBlockReference")
        (setq result (mc:add-block-attributes obj result))
       )
+      ;; MULTILEADER: use dedicated collector that reads TextLocation,
+      ;; not InsertionPoint (which returns the arrowhead tip on MLeader).
+      ((wcmatch oname "AcDbMLeader")
+       (setq result (mc:add-mleader-text obj result))
+      )
     )
-    (setq i (1+ i))
   )
   result
 )
@@ -592,31 +658,6 @@
 ;;; -------------------------------------------------------------------
 ;;; Matching helpers
 ;;; -------------------------------------------------------------------
-(defun mc:find-best-dim-match (iEntry metricList / expected best bestScore bestVDiff bestPDist mEntry mVal vDiff pDist score)
-  (setq best nil bestScore nil bestVDiff nil bestPDist nil)
-  (if (and iEntry (numberp (car iEntry)))
-    (progn
-      (setq expected (* (abs (car iEntry)) *mc-conv*))
-      (foreach mEntry metricList
-        (setq mVal (car mEntry))
-        (if (numberp mVal)
-          (progn
-            (setq vDiff (abs (- (abs mVal) expected)))
-            (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
-            (if (<= vDiff *mc-tolerance*)
-              (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
-              (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
-            )
-            (if (or (not bestScore) (< score bestScore))
-              (setq best mEntry bestScore score bestVDiff vDiff bestPDist pDist)
-            )
-          )
-        )
-      )
-    )
-  )
-  (if best (list best bestVDiff bestPDist) nil)
-)
 
 (defun mc:global-best-number-pairs (inchNums metricNums / candidates iIdx mIdx iVal mVal expected diff sorted selected usedI usedM cand)
   (setq candidates nil iIdx 0)
@@ -653,49 +694,6 @@
     (progn (setq total 0.0) (foreach p pairs (setq total (+ total (cadddr p)))) total)
     nil
   )
-)
-(defun mc:find-best-text-match (iEntry metricList / iNums mNums best bestScore bestVDiff bestPDist mEntry vDiff pDist score)
-  ;; Clean value match only, category-safe.
-  (setq iNums (mc:extract-conversion-numbers (car iEntry)) best nil bestScore nil bestVDiff nil bestPDist nil)
-  (if iNums
-    (foreach mEntry metricList
-      (if (mc:same-text-kind-p iEntry mEntry)
-        (progn
-          (setq mNums (mc:extract-conversion-numbers-metric (car mEntry)))
-          (setq vDiff (mc:text-values-total-diff iNums mNums))
-          (if vDiff
-            (progn
-              (setq pDist (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
-              (if (<= vDiff *mc-tolerance*)
-                (setq score (+ (* vDiff 1000.0) (* pDist *mc-position-weight-pass*)))
-                (setq score (+ 1000000.0 (* vDiff 1000.0) (* pDist *mc-position-weight-fail*)))
-              )
-              (if (or (not bestScore) (< score bestScore))
-                (setq best mEntry bestScore score bestVDiff vDiff bestPDist pDist)
-              )
-            )
-          )
-        )
-      )
-    )
-  )
-  (if (and best bestVDiff (<= bestVDiff *mc-text-max-sane-diff*)) (list best bestVDiff bestPDist) nil)
-)
-(defun mc:find-nearest-text-match (iEntry metricList / best bestD d mEntry)
-  ;; Category-safe positional fallback. This is what makes wrong paired attributes fail instead of ??,
-  ;; without allowing DIA to match TOL.
-  (setq best nil bestD nil)
-  (foreach mEntry metricList
-    (if (and (mc:same-text-kind-p iEntry mEntry) (mc:extract-conversion-numbers-metric (car mEntry)))
-      (progn
-        (setq d (mc:pos-distance-best (cadr iEntry) (cadr mEntry)))
-        (if (and (< d *mc-text-position-limit*) (or (not bestD) (< d bestD)))
-          (setq best mEntry bestD d)
-        )
-      )
-    )
-  )
-  (if best (list best bestD) nil)
 )
 
 (defun mc:unmatched-by-index (lst used / result idx x)
@@ -951,9 +949,11 @@
           (if (/= mDimLen iDimLen)
             (princ (strcat "\nInfo: dimension count differs: " (itoa iDimLen) " inch vs " (itoa mDimLen) " metric.")))
           (if (/= mTxtLen iTxtLen)
-            (princ (strcat "\nInfo: text/attribute count differs: " (itoa iTxtLen) " inch vs " (itoa mTxtLen) " metric. Ignored blocks: C, REVSYMB, REVC.")))
+            (princ (strcat "\nInfo: text/attribute count differs: " (itoa iTxtLen) " inch vs " (itoa mTxtLen) " metric."
+                           "\n  Ignored blocks: C, REVSYMB, REVC, REVTRI, REVCIRCLE, TITLEBLOCK, BORDER, TB, TITLE, REVISION, REVCLOUD, FRAME")))
 
           ;; --------------------------- dimension check -----------------------
+          (princ "\nMatching dimensions...")
           (setq dimPlan (mc:global-dim-assignments inchDims metricDims)
                 dimAssignments (car dimPlan)
                 unmatchedInchDims (cadr dimPlan)
@@ -991,7 +991,10 @@
             (setq dimMarkers (cons (list nil (mc:make-unmatched-metric-label (car mEntry)) (cadr mEntry)) dimMarkers))
           )
 
+          (princ (strcat " done. " (itoa dimPass) " pass, " (itoa dimFail) " fail/missing."))
+
           ;; ------------------------ text/attribute check ---------------------
+          (princ "\nMatching text/attributes...")
           (setq textPlan (mc:global-text-assignments inchTexts metricTexts)
                 textAssignments (car textPlan)
                 unmatchedInchTexts (cadr textPlan)
@@ -1048,6 +1051,8 @@
             )
           )
 
+          (princ (strcat " done. " (itoa txtPass) " pass, " (itoa txtFail) " fail/missing."))
+
           ;; ----------------------------- output ------------------------------
           (princ "\nUpdating QC layers...")
           (mc:clear-qc-layers)
@@ -1070,16 +1075,16 @@
           (princ
             (strcat
               "\n--------------------------------------------\n"
-              "METRIC CHECK DONE v15.0-CANONICAL-PRO\n"
+              "METRIC CHECK DONE v16.0-CANONICAL-PRO\n"
               "  Dimensions : " (itoa dimPass) " pass  " (itoa dimFail) " fail/missing\n"
               "  Text/MText/Attr : " (itoa txtPass) " pass  " (itoa txtFail) " fail/missing\n"
               "  Missing inch dimension matches : " (itoa missingDimCount) "\n"
               "  Unmatched metric dimensions   : " (itoa unmatchedMetricDimCount) "\n"
               "  Suspicious/missing text/attr  : " (itoa textMissingCount) "\n"
               "  Ignored non-dimensional metric text/attr : " (itoa ignoredMetricTexts) "\n"
-              "  Ignored block names : C, REVSYMB, REVC\n"
+              "  Ignored block names : C, REVSYMB, REVC, REVTRI, REVCIRCLE, TITLEBLOCK, BORDER, TB, TITLE, REVISION, REVCLOUD, FRAME\n"
               "  Inch source open mode : " (if inchIsDbx "ObjectDBX invisible" "visible fallback read-only") "\n"
-              "  Key fixes : global assignment; DIA/RAD before TOL; safe source cleanup\n"
+              "  Key fixes : global assignment; DIA/RAD before TOL; safe source cleanup; MTEXT stacked-frac strip; MLeader support\n"
               "--------------------------------------------"
             )
           )
@@ -1140,7 +1145,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_CHECK.LSP v15.0-CANONICAL-PRO loaded.")
+(princ "\nMETRIC_CHECK.LSP v16.0-CANONICAL-PRO loaded.")
 (princ "\n  METRIC_CHECK -- ObjectDBX no-window source read, category-safe matching")
 (princ "\n  METRIC_CLEAR -- erase all QC balloons and layers")
 (princ "\n  MC_SELFTEST -- parser/matcher self-test")

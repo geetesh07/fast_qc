@@ -1,0 +1,1 @@
+1. v17-2 is the best version. It is fast, accounts for Nm to ft lb and weights in mode 3. Everythign works well but some issues in weight thing.

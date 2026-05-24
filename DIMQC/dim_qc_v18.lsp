@@ -580,7 +580,7 @@
 ;;;  PART 5 - INLINE N [M] SCANNER (for Mode 3 text entities)
 ;;; ============================================================================
 
-(defun DQC:scan-inline-dims (txt / results i len ch ns in-n dot j k as closed ns2 dot2)
+(defun DQC:scan-inline-dims (txt / results i len ch ns in-n dot j k as closed ns2 dot2 full-inch)
   (setq results nil i 1 len (strlen txt))
   (while (<= i len)
     (setq ch (substr txt i 1))
@@ -626,11 +626,18 @@
                      (setq i j)))
                  (setq i j)))
              (setq i j)))
-          ;; Case B: optional spaces then [ - simple N [M]
+          ;; Case B: optional spaces/tolerance text then [ - handles "N [M]" and "N+t/-t [M+t/-t]"
           (T
+           (while (and (<= k len) (= (substr txt k 1) " ")) (setq k (1+ k)))
+           ;; Skip tolerance characters (+  - . digits /) that may appear between number and [
+           (while (and (<= k len)
+                       (wcmatch (substr txt k 1) "+,-,#,.,/"))
+             (setq k (1+ k)))
            (while (and (<= k len) (= (substr txt k 1) " ")) (setq k (1+ k)))
            (if (and (<= k len) (= (substr txt k 1) "["))
              (progn
+               ;; full inch-side text: number + any tolerance notation before [
+               (setq full-inch (DQC:trim (substr txt i (- k i))))
                (setq k (1+ k) as "" closed nil)
                (while (and (<= k len) (not closed))
                  (setq ch (substr txt k 1))
@@ -638,7 +645,7 @@
                    (setq as (strcat as ch) k (1+ k))))
                (if closed
                  (progn
-                   (setq results (append results (list (list ns as i))))
+                   (setq results (append results (list (list ns as i nil full-inch))))
                    (setq i k))
                  (setq i j)))
              (setq i j))))
@@ -1009,15 +1016,93 @@
       (setq best p)))
   (if best best 0))
 
+;;; ============================================================================
+;;;  TOLERANCE HELPERS
+;;; ============================================================================
+
+;;; Parse +H/-L tolerance from the start of string s (skips leading spaces/newlines).
+;;; Handles: "+H/-L", "+H\n-L", "+H" (symmetric hi=lo), "%%PH" (AutoCAD ±).
+;;; Returns (hi-val lo-val) as positive numbers, or nil.
+(defun DQC:tol-from-str (s / i su ns hi lo)
+  (setq s (DQC:trim s) i 1)
+  ;; Skip leading whitespace and newlines
+  (while (and (<= i (strlen s))
+              (member (substr s i 1) (list " " "\n" "\t")))
+    (setq i (1+ i)))
+  (if (> i (strlen s)) nil
+    (progn
+      (setq su (substr s i))
+      (cond
+        ;; %%P (AutoCAD ± code) followed by numeric value
+        ((and (>= (strlen su) 4) (= (strcase (substr su 1 3)) "%%P"))
+         (setq ns (DQC:trim (substr su 4)))
+         (setq hi (DQC:atof-safe ns))
+         (if (> hi 0.0) (list hi hi) nil))
+        ;; +H then optional separator then optional -L
+        ((= (substr su 1 1) "+")
+         (setq i 2 ns "")
+         (while (and (<= i (strlen su))
+                     (or (wcmatch (substr su i 1) "#")
+                         (= (substr su i 1) ".")
+                         (= (substr su i 1) ",")))
+           (setq ns (strcat ns (substr su i 1)) i (1+ i)))
+         (setq hi (if (> (strlen ns) 0) (DQC:atof-safe ns) nil))
+         ;; Skip separator: /, space, newline
+         (while (and (<= i (strlen su))
+                     (member (substr su i 1) (list "/" " " "\n" "\t")))
+           (setq i (1+ i)))
+         (if (and (<= i (strlen su)) (= (substr su i 1) "-"))
+           (progn
+             (setq i (1+ i) ns "")
+             (while (and (<= i (strlen su))
+                         (or (wcmatch (substr su i 1) "#")
+                             (= (substr su i 1) ".")
+                             (= (substr su i 1) ",")))
+               (setq ns (strcat ns (substr su i 1)) i (1+ i)))
+             (setq lo (if (> (strlen ns) 0) (DQC:atof-safe ns) nil)))
+           (setq lo nil))
+         (if hi (list hi (if lo lo hi)) nil))
+        (T nil)))))
+
+;;; Extract tolerance from entity text starting at 1-based position kw-end.
+;;; (kw-end is the index of the first char AFTER the keyword.)
+;;; Returns (hi lo) or nil.
+(defun DQC:tol-after-kw (txt kw-end / rest)
+  (if (or (null txt) (null kw-end) (>= kw-end (strlen txt))) nil
+    (DQC:tol-from-str (substr txt (1+ kw-end)))))
+
+;;; Extract tolerance from an entity text that contains [value unit].
+;;; Looks inside the bracket for "+H/-L" after the numeric value,
+;;; then falls back to text after the closing bracket (e.g. next MTEXT line).
+;;; Returns (hi lo) or nil.
+(defun DQC:tol-from-bracket-txt (txt / bpos cpos content p-plus _t)
+  (setq bpos (vl-string-search "[" txt 0))
+  (if (null bpos) nil
+    (progn
+      (setq cpos (vl-string-search "]" txt (1+ bpos)))
+      (if (null cpos) nil
+        (progn
+          (setq content (substr txt (+ bpos 2) (- cpos bpos 1)))
+          ;; Check inside bracket: scan for "+" after the leading number
+          (setq p-plus (vl-string-search "+" content 0))
+          (setq _t (if p-plus (DQC:tol-from-str (substr content (1+ p-plus))) nil))
+          (if _t _t
+            ;; Fallback: tolerance on the line(s) after the bracket
+            (if (< (1+ cpos) (strlen txt))
+              (DQC:tol-from-str (substr txt (+ cpos 2)))
+              nil)))))))
+
 (defun DQC:match-cross-entity (ent-info-list rules
                                / total pass fail rec ename txt pt th
                                  rule kwl altl fac pl al dp-p dp-a tol no-miss
-                                 hits pv alt-val expected ok label layer
+                                 hits pv alt-val expected ok nom-ok label layer
                                  unit-rec unit-pt unit-txt
                                  alt-rec alt-pt alt-txt
                                  dx dy dx2 best-dx
                                  nb-rec nb-txt nb-pt nb-dy nb-dx
-                                 nb-best-dx _nb-alt)
+                                 nb-best-dx _nb-alt
+                                 kw-end alt-src-txt
+                                 prim-tol alt-tol tol-ok tol-str thi-exp tlo-exp)
   (setq total 0 pass 0 fail 0)
 
   (foreach rec ent-info-list
@@ -1075,22 +1160,23 @@
                             hits (list (list pv 1 0 (car kwl))))))))))))
 
       (foreach hit hits
-        (setq pv (car hit)
-              alt-val (if (DQC:find-alt-in-string txt altl 1)
-                        (DQC:find-alt-in-string txt altl 1)
-                        alt-val))
-        ;; Cross-entity: find [alt] in closest right-side entity
-        ;; Cross-entity: find alt value in any nearby entity (any direction).
-        ;; Uses Manhattan distance; dy <= 8*th, dx <= 50*th.
-        ;; Also tries without brackets as fallback for "67.8 N-m" style text.
+        (setq pv          (car hit)
+              kw-end      (+ (nth 1 hit) (nth 2 hit))  ; 1-based index after keyword
+              alt-src-txt nil
+              alt-val     nil)
+        ;; Try to find alt in the same entity first
+        (if (DQC:find-alt-in-string txt altl 1)
+          (setq alt-val     (DQC:find-alt-in-string txt altl 1)
+                alt-src-txt txt))
+        ;; Cross-entity: any direction, Manhattan distance, dy<=8*th, dx<=50*th.
+        ;; Also tries without brackets (fallback) for "67.8 N-m" style text.
         (if (and (null alt-val) pt)
           (progn
             (setq nb-best-dx 1e99)
             (foreach nb-rec ent-info-list
               (setq nb-txt (nth 1 nb-rec)
                     nb-pt  (nth 2 nb-rec))
-              (if (and nb-pt
-                       (not (eq (nth 0 nb-rec) ename)))
+              (if (and nb-pt (not (eq (nth 0 nb-rec) ename)))
                 (progn
                   (setq nb-dy (abs (- (cadr nb-pt) (cadr pt)))
                         nb-dx (abs (- (car nb-pt) (car pt))))
@@ -1099,42 +1185,81 @@
                            (< (+ nb-dy nb-dx) nb-best-dx))
                     (progn
                       (setq _nb-alt (DQC:find-alt-in-string nb-txt altl 1))
-                      ;; Fallback: alt keyword present but not in brackets
                       (if (and (null _nb-alt) (DQC:unit-text-has? nb-txt altl))
                         (setq _nb-alt (DQC:num-before-kw nb-txt
                                         (1+ (DQC:kw-first-pos (strcase nb-txt) altl)))))
                       (if _nb-alt
                         (setq nb-best-dx (+ nb-dy nb-dx)
-                              alt-val _nb-alt)))))))))
+                              alt-val    _nb-alt
+                              alt-src-txt nb-txt)))))))))
 
         (if alt-val
           (progn
             (setq expected (* pv fac)
-                  ok (DQC:ok-abs? pv alt-val fac tol)
-                  total (1+ total))
+                  nom-ok   (DQC:ok-abs? pv alt-val fac tol)
+                  total    (1+ total))
+
+            ;; ── Tolerance check ───────────────────────────────────────────────
+            ;; Skip for split-number synthetic hits (kw-len = 0).
+            (setq prim-tol nil alt-tol nil tol-ok T tol-str "")
+            (if (> (nth 2 hit) 0)
+              (progn
+                ;; Tolerance in primary text: chars after the keyword
+                (setq prim-tol (DQC:tol-after-kw txt kw-end))
+                ;; Tolerance in alt text: inside bracket or after closing ]
+                (if alt-src-txt
+                  (setq alt-tol (DQC:tol-from-bracket-txt alt-src-txt)))
+                (if (and prim-tol alt-tol)
+                  (progn
+                    (setq thi-exp (* (car prim-tol) fac)
+                          tlo-exp (* (cadr prim-tol) fac)
+                          tol-ok  (and (<= (abs (- thi-exp (car alt-tol)))
+                                           (max tol (* thi-exp 0.06)))
+                                       (<= (abs (- tlo-exp (cadr alt-tol)))
+                                           (max tol (* tlo-exp 0.06)))))
+                    ;; Build tolerance annotation for fail label
+                    (if (not tol-ok)
+                      (setq tol-str
+                            (strcat " tol:+"
+                                    (rtos (car alt-tol) 2 dp-a) "/-"
+                                    (rtos (cadr alt-tol) 2 dp-a)
+                                    " exp:+"
+                                    (rtos thi-exp 2 dp-a) "/-"
+                                    (rtos tlo-exp 2 dp-a))))))))
+
+            (setq ok (and nom-ok tol-ok))
             (if ok
-              (setq pass (1+ pass)
+              (setq pass  (1+ pass)
                     label (DQC:pass-label)
                     layer DQC:PASS-LAYER)
-              (setq fail (1+ fail)
-                    label (DQC:fail-label
-                            (strcat "\\U+2717 "
-                                    (rtos pv 2 dp-p) " " pl " ["
-                                    (rtos alt-val 2 dp-a) " " al
-                                    "] exp "
-                                    (rtos expected 2 dp-a) " " al))
-                    layer DQC:FAIL-LAYER))
+              (progn
+                (setq fail (1+ fail))
+                (if nom-ok
+                  ;; Nominal OK but tolerance conversion wrong
+                  (setq label (DQC:fail-label
+                                (strcat "\\U+2717 "
+                                        (rtos pv 2 dp-p) " " pl
+                                        " [" (rtos alt-val 2 dp-a) " " al "]"
+                                        tol-str))
+                        layer DQC:FAIL-LAYER)
+                  ;; Nominal value wrong (show expected; append tol info if any)
+                  (setq label (DQC:fail-label
+                                (strcat "\\U+2717 "
+                                        (rtos pv 2 dp-p) " " pl
+                                        " [" (rtos alt-val 2 dp-a) " " al
+                                        "] exp " (rtos expected 2 dp-a) " " al
+                                        tol-str))
+                        layer DQC:FAIL-LAYER))))
             (DQC:place-balloon pt th 0.0 label layer))
+
           ;; Alt not found
           (if (not no-miss)
             (progn
-              (setq total (1+ total)
-                    fail (1+ fail))
+              (setq total (1+ total) fail (1+ fail))
               (DQC:place-balloon pt th 0.0
                 (DQC:fail-label
                   (strcat "\\U+2717 " (rtos pv 2 dp-p) " " pl " [?]"))
                 DQC:FAIL-LAYER))
-            ;; no-miss mode: silently skip - no tick placed
             nil)))))
 
   (list total pass fail))
@@ -1466,7 +1591,9 @@
 (defun DQC:check-inline-mm-info (rec total pass fail / ename txt pt th
                                        hits hit pv av expected ok label layer
                                        hit-pos hit-pt df
-                                       pv1 pv2 av1 av2 ok1 ok2 sla tol1 tol2 ov)
+                                       pv1 pv2 av1 av2 ok1 ok2 sla tol1 tol2 ov
+                                       inch-full in-tol-i mm-tol-i tol-ok-i
+                                       i-hi i-lo m-hi-ex m-lo-ex m-hi-ac m-lo-ac t-hi t-lo)
   (setq ename (nth 0 rec) txt (nth 1 rec) pt (nth 2 rec) th (nth 3 rec))
   (setq hits (DQC:scan-inline-dims txt))
   (foreach hit hits
@@ -1519,12 +1646,35 @@
                  df (abs (- expected (abs av)))
                  ok (<= df 0.5)
                  total (1+ total))
+           ;; Tolerance validation using full inch text captured by scan-inline-dims
+           (setq in-tol-i nil mm-tol-i nil tol-ok-i T
+                 inch-full (nth 4 hit))
+           (if inch-full
+             (progn
+               (setq in-tol-i (DQC:extract-tol inch-full)
+                     mm-tol-i (DQC:extract-tol (cadr hit)))))
+           (if (and ok in-tol-i mm-tol-i)
+             (progn
+               (setq i-hi    (DQC:tol-val (car in-tol-i))
+                     i-lo    (DQC:tol-val (cadr in-tol-i))
+                     m-hi-ex (* i-hi DQC:MM/IN)
+                     m-lo-ex (* i-lo DQC:MM/IN)
+                     m-hi-ac (DQC:tol-val (car mm-tol-i))
+                     m-lo-ac (DQC:tol-val (cadr mm-tol-i))
+                     t-hi    (max (DQC:rounding-tol (DQC:trim (car mm-tol-i))) 0.01)
+                     t-lo    (max (DQC:rounding-tol (DQC:trim (cadr mm-tol-i))) 0.01))
+               (if (not (and (<= (abs (- m-hi-ex m-hi-ac)) t-hi)
+                             (<= (abs (- m-lo-ex m-lo-ac)) t-lo)))
+                 (setq tol-ok-i nil ok nil))))
            (if ok
              (setq pass (1+ pass) label (DQC:pass-label) layer DQC:PASS-LAYER)
              (setq fail (1+ fail)
                    label (DQC:fail-label
-                           (strcat "\\U+2717 " (car hit) " [" (cadr hit)
-                                   "] exp " (rtos expected 2 2) " mm"))
+                           (strcat "\\U+2717 "
+                                   (if inch-full inch-full (car hit))
+                                   " [" (cadr hit) "] exp "
+                                   (rtos expected 2 2) " mm"
+                                   (if tol-ok-i "" " (tol mismatch)")))
                    layer DQC:FAIL-LAYER))
            (if (and pt th hit-pos)
              (progn
@@ -1897,7 +2047,7 @@
   (DQC:erase-balloons doc)
 
   (princ "\n============================================")
-  (princ "\n  DIM QC v17.2 - Select Check Mode")
+  (princ "\n  DIM QC v18 - Select Check Mode")
   (princ "\n============================================")
   (princ "\n  1. Operating Conditions Check")
   (princ "\n  2. MED Check")
@@ -2006,7 +2156,7 @@
 ;;;  LOAD MESSAGE
 ;;; ============================================================================
 (princ "\n================================================\n")
-(princ " DIM QC v17.2 Loaded.\n")
+(princ " DIM QC v18 Loaded.\n")
 (princ "   DIMQC        Mode menu:\n")
 (princ "     1 = Operating Conditions (HP/kW integer, IN-LB/N-M integer)\n")
 (princ "     2 = MED Check (LB/KG, torque, stiffness, PSI)\n")
