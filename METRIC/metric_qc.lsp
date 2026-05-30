@@ -1,5 +1,11 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.0   (clean rewrite)
+;;; METRIC_QC.LSP  v2.1   (clean rewrite)
+;;;
+;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
+;;;       matching inside a cluster of near-identical callouts is no longer
+;;;       a false MISSING -- if its converted value exists in an unmatched
+;;;       metric entity anywhere, they are paired.  MISSING now strictly
+;;;       means "this converted value appears NOWHERE in the metric drawing".
 ;;;
 ;;; PURPOSE
 ;;;   Verify that an inch drawing was correctly converted to a metric
@@ -504,6 +510,38 @@
             s (+ s (* dx dx) (* dy dy)) n (1+ n))))
   (if (> n 0) (sqrt (/ s n)) 0.0)
 )
+;; Value signature of an entry: dim -> its number; text -> its first number.
+(defun qc:entry-vkey (e / v)
+  (setq v (cadr e))
+  (cond ((numberp v) v)
+        ((and (listp v) v (numberp (car v))) (car v))
+        (T nil))
+)
+;; Collapse COINCIDENT DUPLICATES: entries at essentially the same position
+;; AND the same value are one requirement, not two (common from copy-paste,
+;; or a block + overlapping text).  posTol is a tiny fraction of drawing
+;; spread, so two DISTINCT holes/callouts (always meaningfully apart) are
+;; never merged -- only literal overlaps.  This stops a duplicated inch
+;; callout from producing a phantom MISSING when metric carries it once.
+(defun qc:dedup-coincident (lst / c sp posTol kept e p vk k dup)
+  (setq c (qc:centroid lst))
+  (if (not c)
+    lst
+    (progn
+      (setq sp (qc:spread lst c))
+      (if (<= sp 1e-9) (setq sp 1.0))
+      (setq posTol (* sp 1.0e-4) kept nil)   ; 0.01% of spread = truly coincident
+      (foreach e lst
+        (setq p (car e) vk (qc:entry-vkey e) dup nil)
+        (foreach k kept
+          (if (and (not dup) (qc:xy-p p) (qc:xy-p (car k))
+                   (< (qc:dist p (car k)) posTol)
+                   vk (qc:entry-vkey k)
+                   (equal vk (qc:entry-vkey k) 1e-6))
+            (setq dup T)))
+        (if (not dup) (setq kept (cons e kept))))
+      (reverse kept)))
+)
 ;; Value-agreement predicates used as a tie-breaker during position matching.
 (defun qc:dim-valok (ie me)
   (<= (abs (- (abs (cadr me)) (* (abs (cadr ie)) *qc-conv*))) *qc-tol*)
@@ -581,6 +619,39 @@
             ui  (cons (cadr c) ui)
             um  (cons (caddr c) um))))
   (reverse sel)
+)
+
+;;; Value-rescue pass.
+;;;   "MISSING" must mean a converted value appears NOWHERE in the metric
+;;;   drawing -- not merely that greedy position-matching stranded an entity
+;;;   in a cluster of near-identical callouts (e.g., a 12x hole pattern with
+;;;   leader copies).  After position matching, each still-unmatched inch
+;;;   entity is paired with the NEAREST still-unmatched metric entity whose
+;;;   value converts correctly (valfn = T).  If no metric value matches, it
+;;;   stays MISSING -- so a genuinely un-converted dimension is still caught.
+;;;   Returns (rescued-pairs still-missing-inch still-extra-metric).
+(defun qc:value-rescue (missI missM valfn
+                        / pairs stillI stillM usedM ie me j d bestMe bestJ bestD)
+  (setq pairs nil stillI nil usedM nil)
+  (foreach ie missI
+    (setq bestMe nil bestJ nil bestD 1.0e99 j 0)
+    (foreach me missM
+      (if (and (not (qc:member j usedM)) (apply valfn (list ie me)))
+        (progn
+          (setq d (if (and (qc:xy-p (car ie)) (qc:xy-p (car me)))
+                    (qc:dist (car ie) (car me))
+                    0.0))
+          (if (< d bestD) (setq bestD d bestMe me bestJ j))))
+      (setq j (1+ j)))
+    (if bestMe
+      (setq pairs (cons (list ie bestMe 0.0) pairs)
+            usedM (cons bestJ usedM))
+      (setq stillI (cons ie stillI))))
+  (setq stillM nil j 0)
+  (foreach me missM
+    (if (not (qc:member j usedM)) (setq stillM (cons me stillM)))
+    (setq j (1+ j)))
+  (list (reverse pairs) (reverse stillI) (reverse stillM))
 )
 
 ;;; -------------------------------------------------------------------
@@ -694,7 +765,7 @@
 (defun c:metric_check
     (/ *error* oldError oldCmd acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
        mc-res ic-res metricDims metricTexts inchDims inchTexts
-       dimRes dMatched dMiss dExtra txtRes tMatched tMiss tExtra
+       dimRes dMatched dMiss dExtra txtRes tMatched tMiss tExtra dResc tResc
        dimMarks txtMarks dimPass dimFail txtPass txtFail
        missDim extraDim missTxt extraTxt
        pr ie me iv mv exp df pass bp inums mnums pairs body bad q qi qm qe qd
@@ -718,7 +789,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.0] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.1] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res))
@@ -748,6 +819,13 @@
   (setq *qc-active-inch-doc* nil *qc-active-inch-dbx* nil)
   (vla-Activate metricDoc)
 
+  ;; Collapse coincident duplicates on BOTH sides so copy-paste / overlapping
+  ;; callouts don't create phantom count asymmetry (false MISSING / EXTRA).
+  (setq inchDims    (qc:dedup-coincident inchDims)
+        metricDims  (qc:dedup-coincident metricDims)
+        inchTexts   (qc:dedup-coincident inchTexts)
+        metricTexts (qc:dedup-coincident metricTexts))
+
   (setq dimMarks nil txtMarks nil
         dimPass 0 dimFail 0 txtPass 0 txtFail 0
         missDim 0 extraDim 0 missTxt 0 extraTxt 0)
@@ -758,6 +836,12 @@
         dMatched (car   dimRes)
         dMiss    (cadr  dimRes)
         dExtra   (caddr dimRes))
+  ;; rescue: an unmatched inch dim whose converted value exists in an
+  ;; unmatched metric dim is NOT missing -- pair them (will read as PASS).
+  (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
+        dMatched (append dMatched (car dResc))
+        dMiss    (cadr  dResc)
+        dExtra   (caddr dResc))
 
   (foreach pr dMatched
     (setq ie   (car pr)   me (cadr pr)
@@ -787,6 +871,12 @@
         tMatched (car   txtRes)
         tMiss    (cadr  txtRes)
         tExtra   (caddr txtRes))
+  ;; rescue: unmatched inch text whose converted number(s) exist in an
+  ;; unmatched metric text (e.g. clustered counterbore callouts) -> pair them.
+  (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
+        tMatched (append tMatched (car tResc))
+        tMiss    (cadr  tResc)
+        tExtra   (caddr tResc))
 
   (foreach pr tMatched
     (setq ie    (car pr)   me (cadr pr)
@@ -845,7 +935,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.0  --  position-match / value-verify\n"
+      "METRIC_QC v2.1  --  position-match / value-verify / value-rescue\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -866,7 +956,8 @@
 ;;; ===================================================================
 (defun c:mqc_diag
     (/ *error* oldError acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
-       mc-res ic-res metricDims inchDims dimRes dMatched dMiss dExtra
+       mc-res ic-res metricDims inchDims metricTexts inchTexts
+       dimRes dMatched dMiss dExtra dResc txtRes tMatched tMiss tExtra tResc
        pr ie me iv mv exp df)
   (vl-load-com)
   (setq oldError *error*)
@@ -881,10 +972,10 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.0 ===")
-  (princ "\nReading metric dims...")
-  (setq mc-res (qc:collect metricDoc) metricDims (car mc-res))
-  (princ (strcat " " (itoa (length metricDims)) " dim(s)."))
+  (princ "\n=== MQC_DIAG v2.1 ===")
+  (princ "\nReading metric...")
+  (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res))
+  (princ (strcat " " (itoa (length metricDims)) " dim(s), " (itoa (length metricTexts)) " text(s)."))
 
   (setq inchFile (getfiled "Select Inch Source Drawing" metricDir "dwg" 4))
   (if (not inchFile)
@@ -894,28 +985,60 @@
     (progn (princ "\nERROR: could not open.") (setq *error* oldError) (princ) (exit)))
   (setq inchDoc (car inchOpen) inchIsDbx (cadr inchOpen)
         *qc-active-inch-doc* inchDoc *qc-active-inch-dbx* inchIsDbx)
-  (princ "\nReading inch dims...")
-  (setq ic-res (qc:collect inchDoc) inchDims (car ic-res))
-  (princ (strcat " " (itoa (length inchDims)) " dim(s)."))
+  (princ "\nReading inch...")
+  (setq ic-res (qc:collect inchDoc) inchDims (car ic-res) inchTexts (cadr ic-res))
+  (princ (strcat " " (itoa (length inchDims)) " dim(s), " (itoa (length inchTexts)) " text(s)."))
   (qc:close-inch inchDoc inchIsDbx)
   (setq *qc-active-inch-doc* nil *qc-active-inch-dbx* nil)
 
+  (setq inchDims    (qc:dedup-coincident inchDims)
+        metricDims  (qc:dedup-coincident metricDims)
+        inchTexts   (qc:dedup-coincident inchTexts)
+        metricTexts (qc:dedup-coincident metricTexts))
+
+  ;; ----- DIMENSIONS -----
   (setq dimRes   (qc:match inchDims metricDims *qc-dim-gate* 'qc:dim-valok)
         dMatched (car dimRes) dMiss (cadr dimRes) dExtra (caddr dimRes))
+  (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
+        dMatched (append dMatched (car dResc))
+        dMiss    (cadr dResc) dExtra (caddr dResc))
 
-  (princ "\n\n--- MATCHED (by position) ---")
+  (princ "\n\n=== DIMENSIONS ===")
+  (princ "\n--- MATCHED ---")
   (foreach pr dMatched
     (setq ie (car pr) me (cadr pr) iv (cadr ie) mv (cadr me)
           exp (* (abs iv) *qc-conv*) df (abs (- (abs mv) exp)))
     (princ (strcat "\n  " (if (<= df *qc-tol*) "PASS  " "FAIL  ")
                    (qc:fmt iv) "\" -> " (qc:fmt mv) "mm  (exp " (qc:fmt exp)
                    "  diff " (qc:fmt df) ")")))
-  (princ "\n\n--- MISSING (inch dim, no metric at that spot) ---")
+  (princ "\n--- MISSING (converted value found NOWHERE in metric) ---")
   (foreach ie dMiss
     (princ (strcat "\n  " (qc:fmt (cadr ie)) "\"  exp " (qc:fmt (* (abs (cadr ie)) *qc-conv*)) "mm")))
-  (princ "\n\n--- EXTRA (metric dim, no inch at that spot) ---")
+  (princ "\n--- EXTRA (metric dim, no inch source) ---")
   (foreach me dExtra
     (princ (strcat "\n  " (qc:fmt (cadr me)) "mm")))
+
+  ;; ----- TEXT / CALLOUTS -----
+  (setq txtRes   (qc:match inchTexts metricTexts *qc-txt-gate* 'qc:txt-valok)
+        tMatched (car txtRes) tMiss (cadr txtRes) tExtra (caddr txtRes))
+  (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
+        tMatched (append tMatched (car tResc))
+        tMiss    (cadr tResc) tExtra (caddr tResc))
+
+  (princ "\n\n=== TEXT / CALLOUTS ===")
+  (princ "\n--- MATCHED ---")
+  (foreach pr tMatched
+    (setq ie (car pr) me (cadr pr))
+    (princ (strcat "\n  [" (qc:fmt (car (cadr ie))) "in] <-> ["
+                   (qc:fmt (car (cadr me))) "mm]   inch=\"" (caddr ie)
+                   "\"  metric=\"" (caddr me) "\"")))
+  (princ "\n--- MISSING (converted value found NOWHERE in metric) ---")
+  (foreach ie tMiss
+    (princ (strcat "\n  first=" (qc:fmt (car (cadr ie))) "in  src=\"" (caddr ie) "\"")))
+  (princ "\n--- EXTRA (metric text, no inch source) ---")
+  (foreach me tExtra
+    (princ (strcat "\n  first=" (qc:fmt (car (cadr me))) "mm  src=\"" (caddr me) "\"")))
+
   (princ "\n\n=== end MQC_DIAG ===\n")
   (setq *error* oldError)
   (princ)
@@ -942,7 +1065,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.0 self-test")
+  (princ "\nMETRIC_QC v2.1 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1029,11 +1152,45 @@
   (setq ok (and res (> (cadddr (car res)) *qc-tol*)))
   (if (qc:check "NTS 703->7030 flagged as fail" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
 
+  ;; VALUE-RESCUE: inch .771 stranded by position (far metric partner) but its
+  ;; converted value 19.5834 exists in an unmatched metric -> rescued, NOT missing.
+  (setq res (qc:value-rescue
+              (list (list (list 0.0 0.0) (list 0.771) "CBORE .771"))   ; stranded inch text
+              (list (list (list 900.0 900.0) (list 19.58) "CBORE 19.58")) ; same value, far away
+              'qc:txt-valok))
+  (setq ok (and (= (length (car res)) 1) (= (length (cadr res)) 0)))
+  (if (qc:check "value-rescue: .771 paired (not false MISSING)" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; REAL miss preserved: inch .771 but NO matching converted value anywhere.
+  (setq res (qc:value-rescue
+              (list (list (list 0.0 0.0) (list 0.771) "CBORE .771"))
+              (list (list (list 5.0 5.0) (list 99.9) "UNRELATED 99.9"))
+              'qc:txt-valok))
+  (setq ok (and (= (length (car res)) 0) (= (length (cadr res)) 1)))
+  (if (qc:check "value-rescue: genuine missing stays MISSING" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; COINCIDENT DEDUP: two identical dims at the same spot collapse to one;
+  ;; a distinct dim elsewhere is kept.
+  (setq res (qc:dedup-coincident
+              (list (list (list 100.0 100.0) 2.0)
+                    (list (list 100.0 100.0) 2.0)     ; exact duplicate
+                    (list (list 300.0 100.0) 2.0))))  ; same value, different spot -> keep
+  (setq ok (= (length res) 2))
+  (if (qc:check "coincident duplicate collapsed, distinct kept" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; DEDUP must NOT merge two distinct same-value dims that are merely close.
+  (setq res (qc:dedup-coincident
+              (list (list (list 0.0 0.0)  5.0)
+                    (list (list 50.0 0.0) 5.0)
+                    (list (list 100.0 0.0) 5.0))))
+  (setq ok (= (length res) 3))
+  (if (qc:check "dedup keeps distinct same-value dims apart" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
   (princ (strcat "\n  " (itoa pass) " passed, " (itoa fail) " failed."))
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.0 loaded.")
+(princ "\nMETRIC_QC.LSP v2.1 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
