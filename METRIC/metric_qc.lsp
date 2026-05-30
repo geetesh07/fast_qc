@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.1   (clean rewrite)
+;;; METRIC_QC.LSP  v2.3   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -64,14 +64,15 @@
 (setq *qc-valbonus*   0.6)
 (setq *qc-max-depth*  8)      ; block nesting recursion limit
 (setq *qc-ignore-blocks*
-  "C,D,KF,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
+  "C,D,KF,BOM,BOM1,REVD,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
 (setq *qc-active-inch-doc* nil)
 (setq *qc-active-inch-dbx* nil)
 
 ;;; accumulators (reset per drawing)
-(setq *qc-dims*   nil)
-(setq *qc-texts*  nil)
-(setq *qc-blocks* nil)
+(setq *qc-dims*    nil)
+(setq *qc-texts*   nil)
+(setq *qc-blocks*  nil)
+(setq *qc-doc-lfac* 1.0)   ; document DIMLFAC of the drawing currently being read
 
 ;;; -------------------------------------------------------------------
 ;;; Tiny helpers
@@ -148,6 +149,16 @@
   (setq r (vl-catch-all-apply 'vla-get-InsertionPoint (list obj)))
   (if (vl-catch-all-error-p r) nil (qc:safearray-xy r))
 )
+;; Entity handle -- a string that is PRESERVED when the conversion script edits
+;; the drawing in place (SaveAs keeps handles).  The inch dim and its converted
+;; metric dim are the SAME entity, hence the SAME handle.  This is the exact
+;; 1:1 key that makes EXTRA/MISSING impossible for in-place conversions.
+(defun qc:obj-handle (obj / r)
+  (setq r (vl-catch-all-apply 'vla-get-Handle (list obj)))
+  (if (and (not (vl-catch-all-error-p r)) (= (type r) 'STR) (> (strlen r) 0))
+    (strcase r)
+    nil)
+)
 (defun qc:blockref-matrix (br / insR ins)
   (setq insR (vl-catch-all-apply 'vla-get-InsertionPoint (list br)))
   (if (vl-catch-all-error-p insR)
@@ -211,8 +222,8 @@
   (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
   (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
   (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
-  (while (vl-string-search "Ø"       u) (setq u (vl-string-subst "%%C" "Ø"        u)))
-  (while (vl-string-search "±"       u) (setq u (vl-string-subst "+/-" "±"        u)))
+  (while (vl-string-search "ÃƒËœ"       u) (setq u (vl-string-subst "%%C" "ÃƒËœ"        u)))
+  (while (vl-string-search "Ã‚Â±"       u) (setq u (vl-string-subst "+/-" "Ã‚Â±"        u)))
   u
 )
 (defun qc:contains-any (s patterns / hit p u)
@@ -332,6 +343,25 @@
        (not (wcmatch oname "*Angular*"))
        (not (wcmatch oname "*Ordinate*")))
 )
+;; Document DIMLFAC (linear scale factor) of a drawing.  A metric drawing
+;; converted from inch geometry typically carries DIMLFAC = 25.4 so its dims
+;; DISPLAY mm while the underlying geometry stays in inches.
+(defun qc:doc-dimlfac (doc / r)
+  (setq r (vl-catch-all-apply 'vla-getvariable (list doc "DIMLFAC")))
+  (if (and (not (vl-catch-all-error-p r)) (numberp r)
+           (>= (abs r) 0.001) (<= (abs r) 1000.0))
+    r
+    1.0)
+)
+;; Effective DIMLFAC for one dimension.  Prefer the object's own DimLFac
+;; (covers per-dim overrides, including a legitimate 1.0 for mm-geometry dims).
+;; ONLY when that read fails do we fall back to the document DIMLFAC -- this is
+;; the fix for dims whose object property can't be fetched via COM/ObjectDBX,
+;; which were being read at the raw inch value (e.g. "exp 181.102 got 7.13").
+;; Read the dimension's OWN DimLFac so we reconstruct the value it actually
+;; DISPLAYS.  We deliberately do NOT fall back to the document DIMLFAC: if the
+;; conversion script left a dim unconverted (still showing the inch value), we
+;; WANT it to read that inch value and FAIL the check, so the user can fix it.
 (defun qc:dimlfac (obj / r)
   (setq r (vl-catch-all-apply 'vlax-get-property (list obj "DimLFac")))
   (if (and (not (vl-catch-all-error-p r)) (numberp r)
@@ -397,17 +427,19 @@
 ;;;   *qc-dims*  element : (worldpos value)
 ;;;   *qc-texts* element : (worldpos nums sourcetext)
 ;;; -------------------------------------------------------------------
+;; Dim entry shape:  (worldpos value handle)
 (defun qc:add-dim (obj mtx / val lp)
   (setq val (qc:dim-value obj) lp (qc:dim-localpos obj))
   (if (and (numberp val) (qc:xy-p lp))
-    (setq *qc-dims* (cons (list (qc:m-apply mtx lp) val) *qc-dims*)))
+    (setq *qc-dims* (cons (list (qc:m-apply mtx lp) val (qc:obj-handle obj)) *qc-dims*)))
 )
-(defun qc:add-text-string (txt lp mtx / nums)
+;; Text entry shape:  (worldpos nums sourcetext handle)
+(defun qc:add-text-string (txt lp mtx handle / nums)
   (if (and (= (type txt) 'STR) (qc:xy-p lp))
     (progn
       (setq nums (qc:dim-numbers txt))
       (if nums
-        (setq *qc-texts* (cons (list (qc:m-apply mtx lp) nums txt) *qc-texts*)))))
+        (setq *qc-texts* (cons (list (qc:m-apply mtx lp) nums txt handle) *qc-texts*)))))
 )
 (defun qc:add-text (obj mtx / oname tr txt lp)
   (setq tr (vl-catch-all-apply 'vla-get-TextString (list obj)))
@@ -416,7 +448,7 @@
       (setq oname (vla-get-ObjectName obj)
             txt   (if (wcmatch oname "*MText*") (qc:strip-mtext tr) tr)
             lp    (qc:obj-insertion obj))
-      (qc:add-text-string txt lp mtx)))
+      (qc:add-text-string txt lp mtx (qc:obj-handle obj))))
 )
 (defun qc:add-mleader (obj mtx / tr lr txt lp)
   (setq tr (vl-catch-all-apply 'vla-get-TextString   (list obj))
@@ -425,7 +457,7 @@
            (not (vl-catch-all-error-p lr)))
     (progn
       (setq txt (qc:strip-mtext tr) lp (qc:safearray-xy lr))
-      (qc:add-text-string txt lp mtx)))
+      (qc:add-text-string txt lp mtx (qc:obj-handle obj))))
 )
 (defun qc:add-attributes (br mtx / hr ar al att lp tr txt)
   (setq hr (vl-catch-all-apply 'vla-get-HasAttributes (list br)))
@@ -441,7 +473,7 @@
               (if (and (not (vl-catch-all-error-p tr)) (= (type tr) 'STR))
                 (progn
                   (setq lp (qc:obj-insertion att))
-                  (qc:add-text-string tr lp mtx))))))))) ; attrib pos already world; mtx=identity at top
+                  (qc:add-text-string tr lp mtx (qc:obj-handle att)))))))))) ; attrib pos already world; mtx=identity at top
 )
 (defun qc:descend-blockref (br mtx depth / lmtx cmtx nm def)
   (if (not (qc:ignored-block-p br))
@@ -482,7 +514,9 @@
             (qc:collect-space blk (qc:m-identity) 0))))))
 )
 (defun qc:collect (doc)
-  (setq *qc-dims* nil *qc-texts* nil *qc-blocks* (vla-get-Blocks doc))
+  (setq *qc-dims* nil *qc-texts* nil
+        *qc-blocks*   (vla-get-Blocks doc)
+        *qc-doc-lfac* (qc:doc-dimlfac doc))
   (qc:collect-space (vla-get-ModelSpace doc) (qc:m-identity) 0)
   (qc:collect-layouts doc)
   (list *qc-dims* *qc-texts*)
@@ -541,6 +575,36 @@
             (setq dup T)))
         (if (not dup) (setq kept (cons e kept))))
       (reverse kept)))
+)
+;; EXACT 1:1 match by entity HANDLE -- the primary matcher.
+;;   An in-place conversion keeps each entity's handle, so the inch dim and its
+;;   metric counterpart share a handle.  Pairing on handle is exact: no gate, no
+;;   ambiguity, and -- crucially -- it makes EXTRA / MISSING impossible whenever
+;;   handles are preserved (every inch entity has its metric twin and vice versa).
+;;   hidx = index of the handle within an entry (dims: 2, texts: 3).
+;;   Returns (matched unmatched-inch unmatched-metric); matched = (ie me 0.0).
+;;   Entries with no handle (nil) are passed through as unmatched for the
+;;   position fallback, so nothing is lost if a converter rebuilt entities.
+(defun qc:match-by-handle (inchL metricL hidx
+                           / mtable i e h cell matched usedM inchLeft metricLeft)
+  (setq mtable nil i 0)
+  (foreach e metricL
+    (setq h (nth hidx e))
+    (if (and h (= (type h) 'STR)) (setq mtable (cons (cons h i) mtable)))
+    (setq i (1+ i)))
+  (setq matched nil usedM nil inchLeft nil)
+  (foreach e inchL
+    (setq h    (nth hidx e)
+          cell (if (and h (= (type h) 'STR)) (assoc h mtable) nil))
+    (if (and cell (not (qc:member (cdr cell) usedM)))
+      (setq matched (cons (list e (nth (cdr cell) metricL) 0.0) matched)
+            usedM   (cons (cdr cell) usedM))
+      (setq inchLeft (cons e inchLeft))))
+  (setq metricLeft nil i 0)
+  (foreach e metricL
+    (if (not (qc:member i usedM)) (setq metricLeft (cons e metricLeft)))
+    (setq i (1+ i)))
+  (list (reverse matched) (reverse inchLeft) (reverse metricLeft))
 )
 ;; Value-agreement predicates used as a tie-breaker during position matching.
 (defun qc:dim-valok (ie me)
@@ -764,7 +828,7 @@
 ;;; ===================================================================
 (defun c:metric_check
     (/ *error* oldError oldCmd acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
-       mc-res ic-res metricDims metricTexts inchDims inchTexts
+       mc-res ic-res metricDims metricTexts inchDims inchTexts metricLfac inchLfac
        dimRes dMatched dMiss dExtra txtRes tMatched tMiss tExtra dResc tResc
        dimMarks txtMarks dimPass dimFail txtPass txtFail
        missDim extraDim missTxt extraTxt
@@ -789,10 +853,11 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.1] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.3] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
-        metricTexts (cadr mc-res))
+        metricTexts (cadr mc-res)
+        metricLfac  *qc-doc-lfac*)
   (princ (strcat " " (itoa (length metricDims)) " dim(s), "
                      (itoa (length metricTexts)) " text(s)."))
 
@@ -811,7 +876,8 @@
   (princ "\nReading inch drawing...")
   (setq ic-res    (qc:collect inchDoc)
         inchDims  (car  ic-res)
-        inchTexts (cadr ic-res))
+        inchTexts (cadr ic-res)
+        inchLfac  *qc-doc-lfac*)
   (princ (strcat " " (itoa (length inchDims)) " dim(s), "
                      (itoa (length inchTexts)) " text(s)."))
 
@@ -819,25 +885,27 @@
   (setq *qc-active-inch-doc* nil *qc-active-inch-dbx* nil)
   (vla-Activate metricDoc)
 
-  ;; Collapse coincident duplicates on BOTH sides so copy-paste / overlapping
-  ;; callouts don't create phantom count asymmetry (false MISSING / EXTRA).
-  (setq inchDims    (qc:dedup-coincident inchDims)
-        metricDims  (qc:dedup-coincident metricDims)
-        inchTexts   (qc:dedup-coincident inchTexts)
-        metricTexts (qc:dedup-coincident metricTexts))
-
   (setq dimMarks nil txtMarks nil
         dimPass 0 dimFail 0 txtPass 0 txtFail 0
         missDim 0 extraDim 0 missTxt 0 extraTxt 0)
 
   ;; ----------------------- DIMENSIONS -------------------------------
   (princ "\nMatching dimensions by position...")
-  (setq dimRes   (qc:match inchDims metricDims *qc-dim-gate* 'qc:dim-valok)
+  ;; Phase 1 -- EXACT handle match. In-place conversion keeps entity handles,
+  ;; so this pairs every dim 1:1 with its converted twin. No EXTRA/MISSING here.
+  (setq dimRes   (qc:match-by-handle inchDims metricDims 2)
         dMatched (car   dimRes)
         dMiss    (cadr  dimRes)
         dExtra   (caddr dimRes))
-  ;; rescue: an unmatched inch dim whose converted value exists in an
-  ;; unmatched metric dim is NOT missing -- pair them (will read as PASS).
+  ;; Phase 2 -- position match on any handle leftovers (only if the converter
+  ;; rebuilt entities and changed handles). Dedup coincident dups on leftovers.
+  (setq dimRes   (qc:match (qc:dedup-coincident dMiss) (qc:dedup-coincident dExtra)
+                           *qc-dim-gate* 'qc:dim-valok)
+        dMatched (append dMatched (car dimRes))
+        dMiss    (cadr  dimRes)
+        dExtra   (caddr dimRes))
+  ;; Phase 3 -- value-rescue: a leftover inch dim whose converted value exists
+  ;; in a leftover metric dim is paired, not called MISSING.
   (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
         dMatched (append dMatched (car dResc))
         dMiss    (cadr  dResc)
@@ -867,12 +935,18 @@
 
   ;; ----------------------- TEXT / ATTRIB ----------------------------
   (princ "\nMatching text by position...")
-  (setq txtRes   (qc:match inchTexts metricTexts *qc-txt-gate* 'qc:txt-valok)
+  ;; Phase 1 -- exact handle match (handle is at index 3 for text entries).
+  (setq txtRes   (qc:match-by-handle inchTexts metricTexts 3)
         tMatched (car   txtRes)
         tMiss    (cadr  txtRes)
         tExtra   (caddr txtRes))
-  ;; rescue: unmatched inch text whose converted number(s) exist in an
-  ;; unmatched metric text (e.g. clustered counterbore callouts) -> pair them.
+  ;; Phase 2 -- position match on leftovers.
+  (setq txtRes   (qc:match (qc:dedup-coincident tMiss) (qc:dedup-coincident tExtra)
+                           *qc-txt-gate* 'qc:txt-valok)
+        tMatched (append tMatched (car txtRes))
+        tMiss    (cadr  txtRes)
+        tExtra   (caddr txtRes))
+  ;; Phase 3 -- value-rescue leftovers.
   (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
         tMatched (append tMatched (car tResc))
         tMiss    (cadr  tResc)
@@ -935,7 +1009,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.1  --  position-match / value-verify / value-rescue\n"
+      "METRIC_QC v2.3  --  HANDLE-match (exact 1:1) -> position -> value-rescue\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -943,6 +1017,7 @@
       "  -- text missing                         : " (itoa missTxt) "\n"
       "  -- text extra                           : " (itoa extraTxt) "\n"
       "  Inch source : " (if inchIsDbx "ObjectDBX invisible" "visible fallback") "\n"
+      "  DIMLFAC     : metric=" (qc:fmt metricLfac) "  inch=" (qc:fmt inchLfac) "\n"
       "  Ignored blocks: " *qc-ignore-blocks* "\n"
       "--------------------------------------------"))
   (if oldCmd (setvar "CMDECHO" oldCmd))
@@ -956,7 +1031,7 @@
 ;;; ===================================================================
 (defun c:mqc_diag
     (/ *error* oldError acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
-       mc-res ic-res metricDims inchDims metricTexts inchTexts
+       mc-res ic-res metricDims inchDims metricTexts inchTexts metricLfac inchLfac
        dimRes dMatched dMiss dExtra dResc txtRes tMatched tMiss tExtra tResc
        pr ie me iv mv exp df)
   (vl-load-com)
@@ -972,10 +1047,12 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.1 ===")
+  (princ "\n=== MQC_DIAG v2.3 ===")
   (princ "\nReading metric...")
-  (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res))
-  (princ (strcat " " (itoa (length metricDims)) " dim(s), " (itoa (length metricTexts)) " text(s)."))
+  (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
+        metricLfac *qc-doc-lfac*)
+  (princ (strcat " " (itoa (length metricDims)) " dim(s), " (itoa (length metricTexts))
+                 " text(s).  DIMLFAC=" (qc:fmt metricLfac)))
 
   (setq inchFile (getfiled "Select Inch Source Drawing" metricDir "dwg" 4))
   (if (not inchFile)
@@ -986,19 +1063,25 @@
   (setq inchDoc (car inchOpen) inchIsDbx (cadr inchOpen)
         *qc-active-inch-doc* inchDoc *qc-active-inch-dbx* inchIsDbx)
   (princ "\nReading inch...")
-  (setq ic-res (qc:collect inchDoc) inchDims (car ic-res) inchTexts (cadr ic-res))
-  (princ (strcat " " (itoa (length inchDims)) " dim(s), " (itoa (length inchTexts)) " text(s)."))
+  (setq ic-res (qc:collect inchDoc) inchDims (car ic-res) inchTexts (cadr ic-res)
+        inchLfac *qc-doc-lfac*)
+  (princ (strcat " " (itoa (length inchDims)) " dim(s), " (itoa (length inchTexts))
+                 " text(s).  DIMLFAC=" (qc:fmt inchLfac)))
   (qc:close-inch inchDoc inchIsDbx)
   (setq *qc-active-inch-doc* nil *qc-active-inch-dbx* nil)
+  (princ (strcat "\n>> metric DIMLFAC=" (qc:fmt metricLfac) "  inch DIMLFAC=" (qc:fmt inchLfac)
+                 "  (if metric=25.4 the converter used display-scaling, not geometry rescale)"))
 
-  (setq inchDims    (qc:dedup-coincident inchDims)
-        metricDims  (qc:dedup-coincident metricDims)
-        inchTexts   (qc:dedup-coincident inchTexts)
-        metricTexts (qc:dedup-coincident metricTexts))
-
-  ;; ----- DIMENSIONS -----
-  (setq dimRes   (qc:match inchDims metricDims *qc-dim-gate* 'qc:dim-valok)
+  ;; ----- DIMENSIONS:  handle match -> position match -> value rescue -----
+  (setq dimRes   (qc:match-by-handle inchDims metricDims 2)
         dMatched (car dimRes) dMiss (cadr dimRes) dExtra (caddr dimRes))
+  (princ (strcat "\n>> dim handle-matches=" (itoa (length dMatched))
+                 "  handle-leftover inch=" (itoa (length dMiss))
+                 "  metric=" (itoa (length dExtra))))
+  (setq dimRes   (qc:match (qc:dedup-coincident dMiss) (qc:dedup-coincident dExtra)
+                           *qc-dim-gate* 'qc:dim-valok)
+        dMatched (append dMatched (car dimRes))
+        dMiss    (cadr dimRes) dExtra (caddr dimRes))
   (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
         dMatched (append dMatched (car dResc))
         dMiss    (cadr dResc) dExtra (caddr dResc))
@@ -1018,9 +1101,16 @@
   (foreach me dExtra
     (princ (strcat "\n  " (qc:fmt (cadr me)) "mm")))
 
-  ;; ----- TEXT / CALLOUTS -----
-  (setq txtRes   (qc:match inchTexts metricTexts *qc-txt-gate* 'qc:txt-valok)
+  ;; ----- TEXT / CALLOUTS:  handle match -> position match -> value rescue -----
+  (setq txtRes   (qc:match-by-handle inchTexts metricTexts 3)
         tMatched (car txtRes) tMiss (cadr txtRes) tExtra (caddr txtRes))
+  (princ (strcat "\n>> text handle-matches=" (itoa (length tMatched))
+                 "  handle-leftover inch=" (itoa (length tMiss))
+                 "  metric=" (itoa (length tExtra))))
+  (setq txtRes   (qc:match (qc:dedup-coincident tMiss) (qc:dedup-coincident tExtra)
+                           *qc-txt-gate* 'qc:txt-valok)
+        tMatched (append tMatched (car txtRes))
+        tMiss    (cadr txtRes) tExtra (caddr txtRes))
   (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
         tMatched (append tMatched (car tResc))
         tMiss    (cadr tResc) tExtra (caddr tResc))
@@ -1065,7 +1155,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.1 self-test")
+  (princ "\nMETRIC_QC v2.3 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1186,11 +1276,39 @@
   (setq ok (= (length res) 3))
   (if (qc:check "dedup keeps distinct same-value dims apart" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
 
+  ;; HANDLE MATCH: same handle pairs regardless of position; every entity 1:1,
+  ;; no EXTRA/MISSING.  Dim entry shape = (pos val handle), so handle index = 2.
+  (setq res (qc:match-by-handle
+              (list (list (list 0.0 0.0)   2.0 "A1")
+                    (list (list 50.0 0.0)  7.13 "B2"))
+              (list (list (list 999.0 9.0) 7.13 "B2")    ; far away but SAME handle
+                    (list (list 0.0 0.0)   50.8 "A1"))
+              2))
+  (setq ok (and (= (length (car res)) 2)
+                (= (length (cadr res)) 0)
+                (= (length (caddr res)) 0)))
+  (if (qc:check "handle match: 1:1 by handle, zero extra/missing" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; HANDLE MATCH preserves the un-converted FAIL: B2 inch 7.13 <-> metric 7.13
+  ;; (handle B2) must pair so it can be flagged FAIL, not hidden.
+  (setq ok nil)
+  (foreach pr (car res)
+    (if (and (= (cadr (car pr)) 7.13) (= (cadr (cadr pr)) 7.13)) (setq ok T)))
+  (if (qc:check "handle match: un-converted dim still paired (flaggable)" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; HANDLE MATCH falls back gracefully when handles are missing (nil).
+  (setq res (qc:match-by-handle
+              (list (list (list 0.0 0.0) 2.0 nil))
+              (list (list (list 0.0 0.0) 50.8 nil))
+              2))
+  (setq ok (and (= (length (car res)) 0) (= (length (cadr res)) 1) (= (length (caddr res)) 1)))
+  (if (qc:check "handle match: no-handle entries fall through to position" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
   (princ (strcat "\n  " (itoa pass) " passed, " (itoa fail) " failed."))
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.1 loaded.")
+(princ "\nMETRIC_QC.LSP v2.3 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
