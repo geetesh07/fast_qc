@@ -417,9 +417,16 @@
   (setq r (vl-catch-all-apply 'vla-get-EffectiveName (list br)))
   (if (and (not (vl-catch-all-error-p r)) (= (type r) 'STR)) r (qc:raw-name br))
 )
-(defun qc:ignored-block-p (br / nm)
-  (setq nm (strcase (qc:eff-name br)))
-  (wcmatch nm *qc-ignore-blocks*)
+;; A block is ignored if EITHER its effective name OR its raw name (trimmed,
+;; upper-cased) is in the ignore list.  Checking both is belt-and-braces: some
+;; blocks return a usable EffectiveName, others only a Name, and dynamic blocks
+;; differ between the two -- this guarantees e.g. a block literally named "D"
+;; is skipped no matter which API answers.
+(defun qc:ignored-block-p (br / e r)
+  (setq e (strcase (vl-string-trim " \t\r\n" (qc:eff-name br)))
+        r (strcase (vl-string-trim " \t\r\n" (qc:raw-name br))))
+  (or (wcmatch e *qc-ignore-blocks*)
+      (wcmatch r *qc-ignore-blocks*))
 )
 
 ;;; -------------------------------------------------------------------
