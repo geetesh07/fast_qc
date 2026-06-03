@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.3   (clean rewrite)
+;;; METRIC_QC.LSP  v2.4   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -64,7 +64,18 @@
 (setq *qc-valbonus*   0.6)
 (setq *qc-max-depth*  8)      ; block nesting recursion limit
 (setq *qc-ignore-blocks*
-  "C,D,KF,BOM,BOM1,REVD,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
+  "C,D,KF,CAP,BOM,BOM1,REVD,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
+;; Words (>= 2 letters, upper-case) that legitimately appear inside a dimension
+;; callout.  They are NOT counted as "prose" when deciding whether a text is a
+;; note vs a dimension.  Anything else of >= 2 letters is treated as prose.
+(setq *qc-dim-keywords*
+  (list "THRU" "DIA" "DIAM" "DIAMETER" "RAD" "RADIUS" "REF" "TYP" "TYPICAL"
+        "MAX" "MIN" "NOM" "NOMINAL" "BSC" "BASIC" "NTS" "PLCS" "PLC" "PLACES"
+        "PLACE" "DEEP" "DP" "CBORE" "CSK" "CSINK" "COUNTERBORE" "COUNTERSINK"
+        "SPOTFACE" "SFACE" "SF" "FLAT" "STRAIGHT" "UNDERCUT" "FACE" "BORE"
+        "BACKFACE" "DEG" "WIDE" "WIDTH" "FULL" "BOTH" "SIDE" "SIDES" "EACH"
+        "FAR" "NEAR" "GROOVE" "CHAMFER" "KEYWAY" "SLOT" "DRILL" "REAM" "TAP"
+        "MM"))
 (setq *qc-active-inch-doc* nil)
 (setq *qc-active-inch-dbx* nil)
 
@@ -222,8 +233,8 @@
   (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
   (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
   (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
-  (while (vl-string-search "ÃƒËœ"       u) (setq u (vl-string-subst "%%C" "ÃƒËœ"        u)))
-  (while (vl-string-search "Ã‚Â±"       u) (setq u (vl-string-subst "+/-" "Ã‚Â±"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã‹Å“"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã‹Å“"        u)))
+  (while (vl-string-search "Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "Ãƒâ€šÃ‚Â±"        u)))
   u
 )
 (defun qc:contains-any (s patterns / hit p u)
@@ -281,56 +292,71 @@
         ((and (not (cadr p)) (not intVal)) (setq intVal (car p))))))
   (cond ((numberp decimalVal) decimalVal) ((numberp intVal) intVal) (T nil))
 )
-(defun qc:bad-word-p (s)
-  (qc:contains-any s
-    (list "SHEET" "REV" "DATE" "DRAWING" "DWG" "TITLE" "CAGE" "SCALE" "ZONE"
-          "APPRO" "CHECK" "DRAWN" "ORDER" "PART" "SERIAL" "S/N" "ITEM"
-          "QTY" "QUANTITY" "PROJECT" "CUSTOMER" "CONTRACT" "SIZE" "CODE"
-          "NO." "NUMBER" "MODEL" "MATERIAL" "FINISH" "NF" "NC" "UNC" "UNF" "NPT"))
+;; --- Note / prose rejection -------------------------------------------------
+;; A dimension callout is short and number-dominated (R0.06, %%C.771 THRU,
+;; 288.925, (3.18)).  A NOTE is prose: a numbered bullet and/or a sentence of
+;; words ("1. MATERIAL: AISI 4340", "BREAK ALL SHARP EDGES 0.25/0.51").  Numbers
+;; inside notes (material grades, spec numbers, edge-break values) are NOT
+;; dimensions and must never be pulled out.
+
+;; Count alphabetic words (>= 2 letters) that are NOT dimension keywords.
+;; Two or more such words => the text reads like prose, not a dimension callout.
+(defun qc:prose-word-count (s / u i len c word words n w)
+  (setq u (strcase s) i 1 len (strlen u) word "" words nil)
+  (while (<= i len)
+    (setq c (substr u i 1))
+    (if (and (>= (ascii c) 65) (<= (ascii c) 90))
+      (setq word (strcat word c))
+      (progn
+        (if (> (strlen word) 0) (setq words (cons word words)))
+        (setq word "")))
+    (setq i (1+ i)))
+  (if (> (strlen word) 0) (setq words (cons word words)))
+  (setq n 0)
+  (foreach w words
+    (if (and (>= (strlen w) 2) (not (member w *qc-dim-keywords*)))
+      (setq n (1+ n))))
+  n
 )
-(defun qc:dim-cue-p (s / u)
-  (setq u (qc:normalize-cc (vl-string-trim " \t\r\n" s)))
-  (or (qc:contains-any u (list "%%C" " DIA" "DIAM" "RAD" " THRU" "+/-"))
-      (= (substr u 1 1) "R"))
-)
-(defun qc:single-number-p (s / pairs stripped ok ch)
-  (setq stripped (vl-string-trim " \t\r\n()[]{}\"'" (qc:strip-mtext s)))
-  (setq pairs (qc:extract-number-pairs stripped) ok T)
-  (foreach ch (mapcar 'chr (vl-string->list stripped))
-    (if (not (or (qc:is-digit ch) (= ch ".") (= ch "+") (= ch "-") (= ch ",")))
-      (setq ok nil)))
-  (and (= (length pairs) 1) ok)
-)
-(defun qc:dimlike-int-p (s / u cleaned pairs allDigits rem ch)
-  (setq u (strcase (qc:strip-mtext s)) pairs (qc:extract-number-pairs u))
-  (if (and (= (length pairs) 1) (numberp (caar pairs)) (not (cadar pairs)))
+;; Text begins with a list bullet: 1-2 leading digits, then "." or ")", then a
+;; space or end-of-string.  Crucially the char AFTER the punctuation must NOT be
+;; a digit -- otherwise a real decimal like "12.421" or "0.625" would be
+;; mistaken for the bullet "12." and wrongly thrown away.
+(defun qc:note-bullet-p (s / tt n p after)
+  (setq tt (vl-string-trim " \t\r\n" s))
+  (if (and (> (strlen tt) 1) (qc:is-digit (substr tt 1 1)))
     (progn
-      (setq cleaned u)
-      (foreach rem (list "(" ")" "[" "]" "{" "}" "\"" "'" "+" "-"
-                         "R" "DIA" "DIAM" "DIAMETER" "%%C" " " "\t" "\r" "\n")
-        (setq cleaned (vl-string-subst "" rem cleaned)))
-      (setq allDigits T)
-      (foreach ch (mapcar 'chr (vl-string->list cleaned))
-        (if (not (qc:is-digit ch)) (setq allDigits nil)))
-      (and (> (strlen cleaned) 0) allDigits))
+      (setq n 1)
+      (if (and (>= (strlen tt) 2) (qc:is-digit (substr tt 2 1))) (setq n 2))
+      (if (>= (strlen tt) (+ n 1))
+        (progn
+          (setq p (substr tt (+ n 1) 1))
+          (if (or (= p ".") (= p ")"))
+            (if (>= (strlen tt) (+ n 2))
+              (progn (setq after (substr tt (+ n 2) 1))
+                     (or (= after " ") (= after "\t")))
+              T)                                  ; punctuation at end -> bullet
+            nil))
+        nil))
     nil)
 )
 ;; Extract the dimensional numbers worth checking from a text string.
-;; Filters out title-block noise, thread callouts, plain integers, etc.
-(defun qc:dim-numbers (str / res raw pairs p val isdec tok)
-  (setq res nil raw (qc:strip-mtext str) pairs (qc:extract-number-pairs raw))
-  (foreach p pairs
-    (setq val (car p) isdec (cadr p) tok (caddr p))
-    (if (and (numberp val) (> (abs val) 0.0) (< (abs val) 1.0e6)
-             (not (and (not (qc:dim-cue-p raw)) (qc:bad-word-p raw))))
-      (cond
-        ((and isdec (>= (strlen tok) 2) (= (substr tok 1 2) "0."))
-         (setq res (cons val res)))
-        ((and isdec (or (qc:dim-cue-p raw) (qc:single-number-p raw)))
-         (setq res (cons val res)))
-        ((and (not isdec) (qc:dimlike-int-p raw))
-         (setq res (cons val res))))))
-  (reverse res)
+;;   * Reject notes / prose / numbered bullets outright (return nil).
+;;   * From a real callout, take only DECIMAL values -- an integer in a callout
+;;     is a count, an angle ("12 X 30deg") or a bullet, none of which convert by
+;;     25.4.  This recognises R0.06, (R6.35), R12.7, %%C.771, 288.925, (3.18)
+;;     and rejects "1. MATERIAL ... 4340", "BREAK ALL SHARP EDGES 0.25/0.51".
+(defun qc:dim-numbers (str / raw res pairs p val isdec)
+  (setq raw (qc:strip-mtext str))
+  (if (or (qc:note-bullet-p raw) (>= (qc:prose-word-count raw) 2))
+    nil
+    (progn
+      (setq pairs (qc:extract-number-pairs raw) res nil)
+      (foreach p pairs
+        (setq val (car p) isdec (cadr p))
+        (if (and isdec (numberp val) (> (abs val) 0.0) (< (abs val) 1.0e6))
+          (setq res (cons val res))))
+      (reverse res)))
 )
 
 ;;; -------------------------------------------------------------------
@@ -860,7 +886,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.3] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.4] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res)
@@ -1016,7 +1042,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.3  --  HANDLE-match (exact 1:1) -> position -> value-rescue\n"
+      "METRIC_QC v2.4  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -1054,7 +1080,7 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.3 ===")
+  (princ "\n=== MQC_DIAG v2.4 ===")
   (princ "\nReading metric...")
   (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
         metricLfac *qc-doc-lfac*)
@@ -1162,7 +1188,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.3 self-test")
+  (princ "\nMETRIC_QC v2.4 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1177,6 +1203,58 @@
   (setq nums (qc:dim-numbers "-.125"))
   (setq ok (and nums (equal (car nums) -0.125 1e-8)))
   (if (qc:check "signed decimal -.125" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; --- fillet / radius text dimensions (must be RECOGNISED) ---
+  (setq nums (qc:dim-numbers "R0.06"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 0.06 1e-8)))
+  (if (qc:check "fillet R0.06 recognised" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "(R6.35)"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 6.35 1e-8)))
+  (if (qc:check "parenthesised (R6.35) recognised" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "R12.7"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 12.7 1e-8)))
+  (if (qc:check "radius R12.7 recognised" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "(3.18)"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 3.18 1e-8)))
+  (if (qc:check "reference dim (3.18) recognised" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; GD&T / counterbore callout: decimals kept, angle + zero dropped
+  (setq nums (qc:dim-numbers "%%C.771 +.015 -.000 X 90"))
+  (setq ok (and (= (length nums) 2) (equal (car nums) 0.771 1e-8) (equal (cadr nums) 0.015 1e-8)))
+  (if (qc:check "callout keeps decimals, drops angle/zero" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; one incidental word is allowed (UNDERCUT/FACE are keywords, IN is 1 prose)
+  (setq nums (qc:dim-numbers ".03 UNDERCUT IN FACE"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 0.03 1e-8)))
+  (if (qc:check "short callout with 1 word still recognised" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; --- notes / bullets / prose (must be REJECTED) ---
+  (setq nums (qc:dim-numbers "1. MATERIAL: AISI 4340 ALLOY STEEL"))
+  (if (qc:check "numbered note bullet rejected" (null nums)) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "BREAK ALL SHARP EDGES 0.25/0.51"))
+  (if (qc:check "prose note (edge break) rejected" (null nums)) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "5. BREAK ALL SHARP EDGES 0.25/0.51 UNLESS SPECIFIED"))
+  (if (qc:check "numbered prose note rejected" (null nums)) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "12 X 30"))
+  (if (qc:check "count x angle (integers) rejected" (null nums)) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "3"))
+  (if (qc:check "bare bullet integer rejected" (null nums)) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  ;; CRITICAL: a multi-digit decimal must NOT be mistaken for a "12." bullet
+  (setq nums (qc:dim-numbers "%%C12.421"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 12.421 1e-8)))
+  (if (qc:check "decimal 12.421 not mistaken for bullet" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
+
+  (setq nums (qc:dim-numbers "0.625 THRU"))
+  (setq ok (and (= (length nums) 1) (equal (car nums) 0.625 1e-8)))
+  (if (qc:check "0.625 THRU recognised (not bullet)" ok) (setq pass (1+ pass)) (setq fail (1+ fail)))
 
   ;; transform matrix: rotate 90deg about origin, point (1,0) -> (0,1)
   (setq m (qc:m-from-insert (list 0.0 0.0) 1.0 1.0 (/ pi 2.0)))
@@ -1315,7 +1393,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.3 loaded.")
+(princ "\nMETRIC_QC.LSP v2.4 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
