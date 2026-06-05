@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.7   (clean rewrite)
+;;; METRIC_QC.LSP  v2.8   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -50,27 +50,20 @@
 (setq *qc-tol*        0.6)    ; mm.  Rounding to nearest whole mm gives <=0.5mm
                               ; error for any size, so 0.6 covers rounding while
                               ; still catching genuine conversion errors.
-;; Position match gate = how far (as a fraction of overall drawing spread) a
-;; dimension may have shifted between inch and metric and still be paired.
-;; Generous enough to absorb a macro nudging dim text "a lil bit"; greedy
-;; nearest-first ordering + the value tie-breaker stop it grabbing a wrong
-;; neighbour.  Raise if real partners are missed; lower if neighbours cross-match.
-(setq *qc-dim-gate*   0.20)   ; dims are sparse -> can be generous
-(setq *qc-txt-gate*   0.12)   ; text is denser -> a bit tighter
-;; When two metric entities fall inside the gate of one inch entity, multiply
-;; the position score of the value-CORRECT candidate by this factor so it wins.
-;; A same-spot wrong-value dim (distance ~ 0) still wins outright, so genuine
-;; un-converted dims are still matched and flagged.
+;; Value tie-breaker: when two metric entities fall inside the absolute
+;; tolerance of one inch entity, multiply the value-CORRECT candidate's score
+;; by this factor so it wins.  A same-spot wrong-value dim (distance ~ 0)
+;; still wins outright because the bonus is a multiplier, so an un-converted
+;; dim is still matched and flagged FAIL.
 (setq *qc-valbonus*   0.6)
-;; Absolute-position match tolerance (drawing units, NOT normalised).
-;; Two entities closer than this are considered "right on top of each other"
-;; and are paired directly, bypassing the spread-normalised gate entirely.
-;; Set generously (25 mm) because a dim's text may shift several mm during
-;; conversion (text repositioning, leader nudging) while still being visually
-;; on top.  qc:match-exact is also guarded by the value tie-breaker via the
-;; subsequent qc:match phase, so a loose tolerance here cannot cause false
-;; pairings of genuinely-different dimensions.
-(setq *qc-exact-tol*  25.0)
+;; Single ABSOLUTE-distance match tolerance, in drawing units (mm in the
+;; metric file).  Replaces the old normalised-spread gate which behaved
+;; differently between drawings (an outlier dim could inflate or shrink the
+;; spread, changing the effective gate).  Absolute is consistent across every
+;; drawing.  Set to 50 mm: any real partner that ended up that far apart
+;; during conversion (text repositioning, leader nudging) is still well
+;; within "on top of each other" when both drawings are overlaid.
+(setq *qc-exact-tol*  50.0)
 (setq *qc-max-depth*  8)      ; block nesting recursion limit
 (setq *qc-ignore-blocks*
   "C,D,KF,CAP,BOM,BOM1,REVD,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
@@ -242,8 +235,8 @@
   (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
   (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
   (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
-  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“"        u)))
-  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
   u
 )
 (defun qc:contains-any (s patterns / hit p u)
@@ -365,7 +358,7 @@
 ;; Extract the dimensional numbers worth checking from a text string.
 ;;   * Reject thread callouts (M20x...), numbered bullets, prose outright.
 ;;   * From a real callout, take only DECIMAL values -- integers are counts,
-;;     angles (12 X 30Ãƒâ€šÃ‚Â°) and bullets, none of which convert by 25.4.
+;;     angles (12 X 30ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°) and bullets, none of which convert by 25.4.
 ;;   Recognises: R0.06  (R6.35)  R12.7  %%C.771  288.925  (3.18)  0.625 THRU
 ;;   Rejects:    M20x212.7P T 1.03   1. MATERIAL AISI 4340   BREAK EDGES 0.25
 (defun qc:dim-numbers (str / raw res pairs p val isdec)
@@ -936,19 +929,19 @@
             lbw  (max (* (strlen body) bh 0.52) (* bh 4.0)))
       ;; Leader LINE from label origin down to dim position
       (vl-catch-all-apply 'entmake
-        (list (list (cons 0 "LINE") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 1)
+        (list (list (cons 0 "LINE") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 7)
                     (cons 100 "AcDbLine")
                     (cons 10 (list ox oy 0.0))
                     (cons 11 (list dx dy 0.0)))))
       ;; Small filled arrowhead circle at the dimension tip
       (vl-catch-all-apply 'entmake
-        (list (list (cons 0 "CIRCLE") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 1)
+        (list (list (cons 0 "CIRCLE") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 7)
                     (cons 100 "AcDbCircle")
                     (cons 10 (list dx dy 0.0))
                     (cons 40 (* bh 0.4)))))
       ;; Error label MTEXT at offset position
       (vl-catch-all-apply 'entmake
-        (list (list (cons 0 "MTEXT") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 1)
+        (list (list (cons 0 "MTEXT") (cons 100 "AcDbEntity") (cons 8 "MC_ERRORS") (cons 62 7)
                     (cons 100 "AcDbMText") (cons 10 (list ox oy 0.0)) (cons 40 bh) (cons 41 lbw)
                     (cons 71 1) (cons 72 1) (cons 1 llbl))))))
 )
@@ -988,7 +981,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.7] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.8] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res)
@@ -1025,30 +1018,22 @@
         missDim 0 extraDim 0 missTxt 0 extraTxt 0)
 
   ;; ----------------------- DIMENSIONS -------------------------------
-  (princ "\nMatching dimensions by position...")
-  ;; Phase 1 -- EXACT handle match (fastest; only works when converter does
-  ;; in-place edits that preserve entity handles).
+  ;; Consistent 3-phase pipeline (no spread-normalised gate -- absolute only).
+  ;;   Phase 1: handle match (exact 1:1 if converter preserved handles).
+  ;;   Phase 2: absolute-distance position match (the drawings are overlaid,
+  ;;            so partners are within *qc-exact-tol* of each other).
+  ;;   Phase 3: value-rescue (last resort -- pair by value if positions drift).
+  (princ "\nMatching dimensions...")
   (setq dimRes   (qc:match-by-handle inchDims metricDims 2)
         dMatched (car   dimRes)
         dMiss    (cadr  dimRes)
         dExtra   (caddr dimRes))
-  ;; Phase 2 -- ABSOLUTE position match on handle leftovers.
-  ;; Two entities within *qc-exact-tol* drawing units are "right on top of
-  ;; each other" and must pair regardless of spread or gate.  This is what fixes
-  ;; the "dimensions on top of each other still saying MISSING" report.
   (setq dimRes   (qc:match-exact (qc:dedup-coincident dMiss)
                                  (qc:dedup-coincident dExtra)
                                  *qc-exact-tol* 'qc:dim-valok)
         dMatched (append dMatched (car dimRes))
         dMiss    (cadr  dimRes)
         dExtra   (caddr dimRes))
-  ;; Phase 3 -- Normalised-gate position match for dims that moved slightly.
-  (setq dimRes   (qc:match dMiss dExtra *qc-dim-gate* 'qc:dim-valok)
-        dMatched (append dMatched (car dimRes))
-        dMiss    (cadr  dimRes)
-        dExtra   (caddr dimRes))
-  ;; Phase 4 -- Value-rescue: leftover inch dim whose converted value exists
-  ;; in a leftover metric dim is paired, not called MISSING.
   (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
         dMatched (append dMatched (car dResc))
         dMiss    (cadr  dResc)
@@ -1077,25 +1062,18 @@
   (princ (strcat " done. " (itoa dimPass) " pass, " (itoa dimFail) " fail."))
 
   ;; ----------------------- TEXT / ATTRIB ----------------------------
-  (princ "\nMatching text by position...")
-  ;; Phase 1 -- exact handle match.
+  ;; Same 3-phase pipeline as dims: handle -> absolute-pos -> value-rescue.
+  (princ "\nMatching text...")
   (setq txtRes   (qc:match-by-handle inchTexts metricTexts 3)
         tMatched (car   txtRes)
         tMiss    (cadr  txtRes)
         tExtra   (caddr txtRes))
-  ;; Phase 2 -- absolute position match (same as dims; catches coincident texts).
   (setq txtRes   (qc:match-exact (qc:dedup-coincident tMiss)
                                  (qc:dedup-coincident tExtra)
                                  *qc-exact-tol* 'qc:txt-valok)
         tMatched (append tMatched (car txtRes))
         tMiss    (cadr  txtRes)
         tExtra   (caddr txtRes))
-  ;; Phase 3 -- normalised gate match for texts that moved slightly.
-  (setq txtRes   (qc:match tMiss tExtra *qc-txt-gate* 'qc:txt-valok)
-        tMatched (append tMatched (car txtRes))
-        tMiss    (cadr  txtRes)
-        tExtra   (caddr txtRes))
-  ;; Phase 4 -- value-rescue leftovers.
   (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
         tMatched (append tMatched (car tResc))
         tMiss    (cadr  tResc)
@@ -1140,7 +1118,7 @@
   (princ "\nPlacing markers...")
   (qc:clear-layers)
   (qc:ensure-layer metricDoc "MC_PASS"   3)
-  (qc:ensure-layer metricDoc "MC_ERRORS" 1)  ; red for errors
+  (qc:ensure-layer metricDoc "MC_ERRORS" 7)  ; white for errors (user request)
   (setq balloonH (qc:balloon-height) errIdx 1)
 
   (foreach m (reverse dimMarks)
@@ -1158,7 +1136,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.7  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
+      "METRIC_QC v2.8  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -1196,7 +1174,7 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.7 ===")
+  (princ "\n=== MQC_DIAG v2.8 ===")
   (princ "\nReading metric...")
   (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
         metricLfac *qc-doc-lfac*)
@@ -1231,9 +1209,6 @@
         dMatched (append dMatched (car dimRes))
         dMiss    (cadr dimRes) dExtra (caddr dimRes))
   (princ (strcat "  exact-pos-matches=" (itoa (length (car dimRes)))))
-  (setq dimRes   (qc:match dMiss dExtra *qc-dim-gate* 'qc:dim-valok)
-        dMatched (append dMatched (car dimRes))
-        dMiss    (cadr dimRes) dExtra (caddr dimRes))
   (setq dResc    (qc:value-rescue dMiss dExtra 'qc:dim-valok)
         dMatched (append dMatched (car dResc))
         dMiss    (cadr dResc) dExtra (caddr dResc))
@@ -1253,7 +1228,7 @@
   (foreach me dExtra
     (princ (strcat "\n  " (qc:fmt (cadr me)) "mm")))
 
-  ;; ----- TEXT / CALLOUTS: 4-phase pipeline -----
+  ;; ----- TEXT / CALLOUTS: handle -> absolute-pos -> value-rescue -----
   (setq txtRes   (qc:match-by-handle inchTexts metricTexts 3)
         tMatched (car txtRes) tMiss (cadr txtRes) tExtra (caddr txtRes))
   (princ (strcat "\n>> text handle-matches=" (itoa (length tMatched))
@@ -1262,9 +1237,7 @@
   (setq txtRes   (qc:match-exact (qc:dedup-coincident tMiss) (qc:dedup-coincident tExtra) *qc-exact-tol* 'qc:txt-valok)
         tMatched (append tMatched (car txtRes))
         tMiss    (cadr txtRes) tExtra (caddr txtRes))
-  (setq txtRes   (qc:match tMiss tExtra *qc-txt-gate* 'qc:txt-valok)
-        tMatched (append tMatched (car txtRes))
-        tMiss    (cadr txtRes) tExtra (caddr txtRes))
+  (princ (strcat "  exact-pos-matches=" (itoa (length (car txtRes)))))
   (setq tResc    (qc:value-rescue tMiss tExtra 'qc:txt-valok)
         tMatched (append tMatched (car tResc))
         tMiss    (cadr tResc) tExtra (caddr tResc))
@@ -1309,7 +1282,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.7 self-test")
+  (princ "\nMETRIC_QC v2.8 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1514,7 +1487,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.7 loaded.")
+(princ "\nMETRIC_QC.LSP v2.8 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
