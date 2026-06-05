@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.6   (clean rewrite)
+;;; METRIC_QC.LSP  v2.7   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -63,10 +63,14 @@
 ;; un-converted dims are still matched and flagged.
 (setq *qc-valbonus*   0.6)
 ;; Absolute-position match tolerance (drawing units, NOT normalised).
-;; Two entities closer than this are considered "right on top of each other" and
-;; are paired directly, bypassing the spread-normalised gate entirely.  Works at
-;; any drawing scale because both drawings share the same coordinate system.
-(setq *qc-exact-tol*  2.0)
+;; Two entities closer than this are considered "right on top of each other"
+;; and are paired directly, bypassing the spread-normalised gate entirely.
+;; Set generously (25 mm) because a dim's text may shift several mm during
+;; conversion (text repositioning, leader nudging) while still being visually
+;; on top.  qc:match-exact is also guarded by the value tie-breaker via the
+;; subsequent qc:match phase, so a loose tolerance here cannot cause false
+;; pairings of genuinely-different dimensions.
+(setq *qc-exact-tol*  25.0)
 (setq *qc-max-depth*  8)      ; block nesting recursion limit
 (setq *qc-ignore-blocks*
   "C,D,KF,CAP,BOM,BOM1,REVD,REVSYMB,REVC,REVTRI,REVCIRCLE,REVCLOUD,REVISION,TITLEBLOCK,BORDER,TB,TITLE,FRAME,LOGO")
@@ -102,28 +106,6 @@
 (defun qc:dist (a b / dx dy)
   (setq dx (- (car a) (car b)) dy (- (cadr a) (cadr b)))
   (sqrt (+ (* dx dx) (* dy dy)))
-)
-;; Dual-distance: try raw distance AND inch-to-mm scaled distance, take min.
-;;
-;; Why this is needed: some converters create a NEW metric DWG by scaling the
-;; inch geometry by 25.4 (so all coordinates become 25.4x larger).  In those
-;; drawings the inch dim sits at e.g. (7.13, 5.0) while the metric dim sits at
-;; (181.1, 127.0) -- completely different raw coordinates.  Raw-only matching
-;; always fails, producing the EXTRA flood.  By also trying the scaled version
-;; (multiply inch coords by 25.4 then compare to metric coords), we handle both:
-;;   * same-coordinate drawings  (raw wins, scaled >> 0)
-;;   * geometry-converted drawings  (scaled wins, raw >> 0)
-;; The smaller of the two is used, so this never makes matching WORSE.
-(defun qc:dist-best (inchPt metricPt / dx dy dRaw sx sy dx2 dy2 dScaled)
-  (setq dx (- (car inchPt) (car metricPt))
-        dy (- (cadr inchPt) (cadr metricPt))
-        dRaw (sqrt (+ (* dx dx) (* dy dy)))
-        sx (* (car inchPt) *qc-conv*)
-        sy (* (cadr inchPt) *qc-conv*)
-        dx2 (- sx (car metricPt))
-        dy2 (- sy (cadr metricPt))
-        dScaled (sqrt (+ (* dx2 dx2) (* dy2 dy2))))
-  (if (< dScaled dRaw) dScaled dRaw)
 )
 (defun qc:member (n lst / f x)
   (setq f nil)
@@ -260,8 +242,8 @@
   (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
   (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
   (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
-  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â¹Ãƒâ€¦Ã¢â‚¬Å“"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â¹Ãƒâ€¦Ã¢â‚¬Å“"        u)))
-  (while (vl-string-search "ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
   u
 )
 (defun qc:contains-any (s patterns / hit p u)
@@ -383,7 +365,7 @@
 ;; Extract the dimensional numbers worth checking from a text string.
 ;;   * Reject thread callouts (M20x...), numbered bullets, prose outright.
 ;;   * From a real callout, take only DECIMAL values -- integers are counts,
-;;     angles (12 X 30Â°) and bullets, none of which convert by 25.4.
+;;     angles (12 X 30Ãƒâ€šÃ‚Â°) and bullets, none of which convert by 25.4.
 ;;   Recognises: R0.06  (R6.35)  R12.7  %%C.771  288.925  (3.18)  0.625 THRU
 ;;   Rejects:    M20x212.7P T 1.03   1. MATERIAL AISI 4340   BREAK EDGES 0.25
 (defun qc:dim-numbers (str / raw res pairs p val isdec)
@@ -716,7 +698,7 @@
             (foreach me metricL
               (if (qc:xy-p (car me))
                 (progn
-                  (setq d (/ (qc:dist-best (car ie) (car me)) sm))
+                  (setq d (/ (qc:dist (car ie) (car me)) sm))
                   (if (< d gate)
                     (progn
                       (setq vok   (if valfn (apply valfn (list ie me)) nil)
@@ -743,8 +725,8 @@
 ;;; runs BEFORE the normalised-gate match so that two entities literally at the
 ;;; same spot always pair, even when a small leftover set produces a tiny spread
 ;;; that makes the normalised gate too tight.
-(defun qc:match-exact (inchL metricL tol
-                       / cand i j ie me d sorted usedI usedM matched ui um c)
+(defun qc:match-exact (inchL metricL tol valfn
+                       / cand i j ie me d vok score sorted usedI usedM matched ui um c)
   (setq cand nil i 0)
   (foreach ie inchL
     (if (qc:xy-p (car ie))
@@ -753,9 +735,18 @@
         (foreach me metricL
           (if (qc:xy-p (car me))
             (progn
-              (setq d (qc:dist-best (car ie) (car me)))
+              (setq d (qc:dist (car ie) (car me)))
               (if (< d tol)
-                (setq cand (cons (list d i j ie me) cand)))))
+                (progn
+                  ;; Value tie-breaker: when a wrong-value and correct-value
+                  ;; metric both fall within the (generous) exact-tol, the
+                  ;; correct-value candidate must win.  A same-spot wrong-value
+                  ;; dim (d ~ 0) still wins outright because the bonus is a
+                  ;; multiplier, so an un-converted dimension is still matched
+                  ;; and flagged FAIL.
+                  (setq vok   (if valfn (apply valfn (list ie me)) nil)
+                        score (* d (if vok *qc-valbonus* 1.0)))
+                  (setq cand (cons (list score i j ie me) cand))))))
           (setq j (1+ j)))))
     (setq i (1+ i)))
   (setq sorted (vl-sort cand '(lambda (a b) (< (car a) (car b))))
@@ -812,7 +803,7 @@
       (if (and (not (qc:member j usedM)) (apply valfn (list ie me)))
         (progn
           (setq d (if (and (qc:xy-p (car ie)) (qc:xy-p (car me)))
-                    (qc:dist-best (car ie) (car me))
+                    (qc:dist (car ie) (car me))
                     0.0))
           (if (< d bestD) (setq bestD d bestMe me bestJ j))))
       (setq j (1+ j)))
@@ -997,7 +988,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.6] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.7] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res)
@@ -1047,7 +1038,7 @@
   ;; the "dimensions on top of each other still saying MISSING" report.
   (setq dimRes   (qc:match-exact (qc:dedup-coincident dMiss)
                                  (qc:dedup-coincident dExtra)
-                                 *qc-exact-tol*)
+                                 *qc-exact-tol* 'qc:dim-valok)
         dMatched (append dMatched (car dimRes))
         dMiss    (cadr  dimRes)
         dExtra   (caddr dimRes))
@@ -1095,7 +1086,7 @@
   ;; Phase 2 -- absolute position match (same as dims; catches coincident texts).
   (setq txtRes   (qc:match-exact (qc:dedup-coincident tMiss)
                                  (qc:dedup-coincident tExtra)
-                                 *qc-exact-tol*)
+                                 *qc-exact-tol* 'qc:txt-valok)
         tMatched (append tMatched (car txtRes))
         tMiss    (cadr  txtRes)
         tExtra   (caddr txtRes))
@@ -1167,7 +1158,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.6  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
+      "METRIC_QC v2.7  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -1205,7 +1196,7 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.6 ===")
+  (princ "\n=== MQC_DIAG v2.7 ===")
   (princ "\nReading metric...")
   (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
         metricLfac *qc-doc-lfac*)
@@ -1236,7 +1227,7 @@
   (princ (strcat "\n>> dim handle-matches=" (itoa (length dMatched))
                  "  leftover inch=" (itoa (length dMiss))
                  "  metric=" (itoa (length dExtra))))
-  (setq dimRes   (qc:match-exact (qc:dedup-coincident dMiss) (qc:dedup-coincident dExtra) *qc-exact-tol*)
+  (setq dimRes   (qc:match-exact (qc:dedup-coincident dMiss) (qc:dedup-coincident dExtra) *qc-exact-tol* 'qc:dim-valok)
         dMatched (append dMatched (car dimRes))
         dMiss    (cadr dimRes) dExtra (caddr dimRes))
   (princ (strcat "  exact-pos-matches=" (itoa (length (car dimRes)))))
@@ -1268,7 +1259,7 @@
   (princ (strcat "\n>> text handle-matches=" (itoa (length tMatched))
                  "  leftover inch=" (itoa (length tMiss))
                  "  metric=" (itoa (length tExtra))))
-  (setq txtRes   (qc:match-exact (qc:dedup-coincident tMiss) (qc:dedup-coincident tExtra) *qc-exact-tol*)
+  (setq txtRes   (qc:match-exact (qc:dedup-coincident tMiss) (qc:dedup-coincident tExtra) *qc-exact-tol* 'qc:txt-valok)
         tMatched (append tMatched (car txtRes))
         tMiss    (cadr txtRes) tExtra (caddr txtRes))
   (setq txtRes   (qc:match tMiss tExtra *qc-txt-gate* 'qc:txt-valok)
@@ -1318,7 +1309,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.6 self-test")
+  (princ "\nMETRIC_QC v2.7 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1523,7 +1514,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.6 loaded.")
+(princ "\nMETRIC_QC.LSP v2.7 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
