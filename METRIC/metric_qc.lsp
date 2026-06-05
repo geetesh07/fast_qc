@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.5   (clean rewrite)
+;;; METRIC_QC.LSP  v2.6   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -102,6 +102,28 @@
 (defun qc:dist (a b / dx dy)
   (setq dx (- (car a) (car b)) dy (- (cadr a) (cadr b)))
   (sqrt (+ (* dx dx) (* dy dy)))
+)
+;; Dual-distance: try raw distance AND inch-to-mm scaled distance, take min.
+;;
+;; Why this is needed: some converters create a NEW metric DWG by scaling the
+;; inch geometry by 25.4 (so all coordinates become 25.4x larger).  In those
+;; drawings the inch dim sits at e.g. (7.13, 5.0) while the metric dim sits at
+;; (181.1, 127.0) -- completely different raw coordinates.  Raw-only matching
+;; always fails, producing the EXTRA flood.  By also trying the scaled version
+;; (multiply inch coords by 25.4 then compare to metric coords), we handle both:
+;;   * same-coordinate drawings  (raw wins, scaled >> 0)
+;;   * geometry-converted drawings  (scaled wins, raw >> 0)
+;; The smaller of the two is used, so this never makes matching WORSE.
+(defun qc:dist-best (inchPt metricPt / dx dy dRaw sx sy dx2 dy2 dScaled)
+  (setq dx (- (car inchPt) (car metricPt))
+        dy (- (cadr inchPt) (cadr metricPt))
+        dRaw (sqrt (+ (* dx dx) (* dy dy)))
+        sx (* (car inchPt) *qc-conv*)
+        sy (* (cadr inchPt) *qc-conv*)
+        dx2 (- sx (car metricPt))
+        dy2 (- sy (cadr metricPt))
+        dScaled (sqrt (+ (* dx2 dx2) (* dy2 dy2))))
+  (if (< dScaled dRaw) dScaled dRaw)
 )
 (defun qc:member (n lst / f x)
   (setq f nil)
@@ -238,8 +260,8 @@
   (while (vl-string-search "\\U+00D8" u) (setq u (vl-string-subst "%%C" "\\U+00D8" u)))
   (while (vl-string-search "\\U+2300" u) (setq u (vl-string-subst "%%C" "\\U+2300" u)))
   (while (vl-string-search "\\U+00B1" u) (setq u (vl-string-subst "+/-" "\\U+00B1" u)))
-  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€¹Ã…â€œ"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€¹Ã…â€œ"        u)))
-  (while (vl-string-search "ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â¹Ãƒâ€¦Ã¢â‚¬Å“"       u) (setq u (vl-string-subst "%%C" "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â¹Ãƒâ€¦Ã¢â‚¬Å“"        u)))
+  (while (vl-string-search "ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"       u) (setq u (vl-string-subst "+/-" "ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±"        u)))
   u
 )
 (defun qc:contains-any (s patterns / hit p u)
@@ -345,15 +367,30 @@
         nil))
     nil)
 )
+;; Thread-callout detection.
+;; Metric thread callouts (M20x212.7P, M12x1.75 THRU, M6x1) start with the
+;; capital letter M directly followed by a digit.  The pitch and length values
+;; inside these strings (e.g. 212.7 in "M20x212.7P T 1.03") look like dimensions
+;; but are NOT -- they don't convert by 25.4 and should never be extracted.
+;; Inch thread callouts that use "NF"/"NC"/"UNC"/"UNF"/"NPT" are already caught
+;; by bad-word-p; this covers the M-prefix metric variety.
+(defun qc:thread-callout-p (s / tt)
+  (setq tt (vl-string-trim " \t\r\n()" s))
+  (and (>= (strlen tt) 2)
+       (= (substr (strcase tt) 1 1) "M")
+       (qc:is-digit (substr tt 2 1)))
+)
 ;; Extract the dimensional numbers worth checking from a text string.
-;;   * Reject notes / prose / numbered bullets outright (return nil).
-;;   * From a real callout, take only DECIMAL values -- an integer in a callout
-;;     is a count, an angle ("12 X 30deg") or a bullet, none of which convert by
-;;     25.4.  This recognises R0.06, (R6.35), R12.7, %%C.771, 288.925, (3.18)
-;;     and rejects "1. MATERIAL ... 4340", "BREAK ALL SHARP EDGES 0.25/0.51".
+;;   * Reject thread callouts (M20x...), numbered bullets, prose outright.
+;;   * From a real callout, take only DECIMAL values -- integers are counts,
+;;     angles (12 X 30Â°) and bullets, none of which convert by 25.4.
+;;   Recognises: R0.06  (R6.35)  R12.7  %%C.771  288.925  (3.18)  0.625 THRU
+;;   Rejects:    M20x212.7P T 1.03   1. MATERIAL AISI 4340   BREAK EDGES 0.25
 (defun qc:dim-numbers (str / raw res pairs p val isdec)
   (setq raw (qc:strip-mtext str))
-  (if (or (qc:note-bullet-p raw) (>= (qc:prose-word-count raw) 2))
+  (if (or (qc:thread-callout-p raw)
+          (qc:note-bullet-p raw)
+          (>= (qc:prose-word-count raw) 2))
     nil
     (progn
       (setq pairs (qc:extract-number-pairs raw) res nil)
@@ -679,7 +716,7 @@
             (foreach me metricL
               (if (qc:xy-p (car me))
                 (progn
-                  (setq d (/ (qc:dist (car ie) (car me)) sm))
+                  (setq d (/ (qc:dist-best (car ie) (car me)) sm))
                   (if (< d gate)
                     (progn
                       (setq vok   (if valfn (apply valfn (list ie me)) nil)
@@ -716,7 +753,7 @@
         (foreach me metricL
           (if (qc:xy-p (car me))
             (progn
-              (setq d (qc:dist (car ie) (car me)))
+              (setq d (qc:dist-best (car ie) (car me)))
               (if (< d tol)
                 (setq cand (cons (list d i j ie me) cand)))))
           (setq j (1+ j)))))
@@ -775,7 +812,7 @@
       (if (and (not (qc:member j usedM)) (apply valfn (list ie me)))
         (progn
           (setq d (if (and (qc:xy-p (car ie)) (qc:xy-p (car me)))
-                    (qc:dist (car ie) (car me))
+                    (qc:dist-best (car ie) (car me))
                     0.0))
           (if (< d bestD) (setq bestD d bestMe me bestJ j))))
       (setq j (1+ j)))
@@ -960,7 +997,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.5] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.6] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res)
@@ -1130,7 +1167,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.5  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
+      "METRIC_QC v2.6  --  HANDLE-match (exact 1:1); decimal-only text dims; note rejection\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
       "  Text/Attr  : " (itoa txtPass) " pass   " (itoa txtFail) " fail\n"
       "  -- dim missing (inch has, metric lacks) : " (itoa missDim) "\n"
@@ -1168,7 +1205,7 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.5 ===")
+  (princ "\n=== MQC_DIAG v2.6 ===")
   (princ "\nReading metric...")
   (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
         metricLfac *qc-doc-lfac*)
@@ -1281,7 +1318,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.5 self-test")
+  (princ "\nMETRIC_QC v2.6 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1486,7 +1523,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.5 loaded.")
+(princ "\nMETRIC_QC.LSP v2.6 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
