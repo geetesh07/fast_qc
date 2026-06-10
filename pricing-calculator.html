@@ -1,0 +1,1708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PriceIQ — Pricing Calculator</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --navy: #0F1C2E;
+    --navy-mid: #1A2D45;
+    --navy-light: #243B55;
+    --blue: #2563EB;
+    --blue-light: #3B82F6;
+    --blue-pale: #EFF6FF;
+    --blue-border: #BFDBFE;
+    --amber: #F59E0B;
+    --amber-light: #FEF3C7;
+    --green: #10B981;
+    --green-light: #D1FAE5;
+    --red: #EF4444;
+    --red-light: #FEE2E2;
+    --slate-50: #F8FAFC;
+    --slate-100: #F1F5F9;
+    --slate-200: #E2E8F0;
+    --slate-300: #CBD5E1;
+    --slate-400: #94A3B8;
+    --slate-500: #64748B;
+    --slate-600: #475569;
+    --slate-700: #334155;
+    --slate-800: #1E293B;
+    --slate-900: #0F172A;
+    --white: #FFFFFF;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --radius-lg: 16px;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+    --shadow: 0 4px 12px rgba(0,0,0,.08), 0 2px 4px rgba(0,0,0,.05);
+    --shadow-lg: 0 16px 40px rgba(15,28,46,.14), 0 4px 12px rgba(15,28,46,.08);
+    --shadow-xl: 0 24px 60px rgba(15,28,46,.18);
+  }
+
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    font-family: 'Inter', sans-serif;
+    background: var(--slate-100);
+    color: var(--slate-800);
+  }
+
+  /* ── APP SHELL ───────────────────────────────── */
+  #app {
+    width: 1200px; height: 780px;
+    margin: 0 auto;
+    display: flex;
+    border-radius: 20px;
+    overflow: hidden;
+    box-shadow: var(--shadow-xl);
+    position: relative;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+
+  /* ── LEFT RAIL ───────────────────────────────── */
+  .rail {
+    width: 260px;
+    flex-shrink: 0;
+    background: var(--navy);
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  .rail::before {
+    content: '';
+    position: absolute;
+    top: -80px; left: -60px;
+    width: 260px; height: 260px;
+    background: radial-gradient(circle, rgba(37,99,235,.35) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .rail::after {
+    content: '';
+    position: absolute;
+    bottom: -60px; right: -40px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(245,158,11,.12) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .rail-logo {
+    padding: 28px 28px 24px;
+    border-bottom: 1px solid rgba(255,255,255,.07);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .rail-logo-icon {
+    width: 34px; height: 34px;
+    background: linear-gradient(135deg, var(--blue) 0%, #1D4ED8 100%);
+    border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+    box-shadow: 0 4px 12px rgba(37,99,235,.4);
+  }
+  .rail-logo-text {
+    font-size: 17px; font-weight: 700;
+    color: var(--white); letter-spacing: -.3px;
+  }
+  .rail-logo-text span { color: var(--blue-light); }
+
+  .rail-steps {
+    padding: 28px 20px;
+    flex: 1;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .step-item {
+    display: flex; align-items: flex-start; gap: 14px;
+    padding: 10px 10px;
+    border-radius: var(--radius-sm);
+    cursor: default;
+    position: relative;
+    transition: background .2s;
+  }
+  .step-item.active { background: rgba(37,99,235,.15); }
+  .step-item.done { cursor: pointer; }
+  .step-item.done:hover { background: rgba(255,255,255,.05); }
+  .step-connector {
+    position: absolute;
+    left: 29px; top: 42px;
+    width: 2px; height: 20px;
+    background: rgba(255,255,255,.1);
+    transition: background .4s;
+  }
+  .step-connector.done { background: rgba(37,99,235,.5); }
+
+  .step-dot {
+    width: 24px; height: 24px; flex-shrink: 0;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+    transition: all .3s;
+    margin-top: 1px;
+  }
+  .step-dot.idle {
+    background: rgba(255,255,255,.08);
+    border: 1.5px solid rgba(255,255,255,.15);
+    color: var(--slate-400);
+  }
+  .step-dot.active {
+    background: var(--blue);
+    border: 1.5px solid var(--blue-light);
+    color: white;
+    box-shadow: 0 0 0 4px rgba(37,99,235,.2);
+  }
+  .step-dot.done {
+    background: rgba(16,185,129,.2);
+    border: 1.5px solid rgba(16,185,129,.4);
+    color: var(--green);
+  }
+  .step-text { flex: 1; }
+  .step-label {
+    font-size: 12px; font-weight: 600; line-height: 1.3;
+    color: rgba(255,255,255,.4);
+    transition: color .3s;
+  }
+  .step-label.active { color: rgba(255,255,255,.95); }
+  .step-label.done { color: rgba(255,255,255,.65); }
+  .step-sublabel {
+    font-size: 11px; font-weight: 400;
+    color: rgba(255,255,255,.3); margin-top: 2px;
+    transition: color .3s;
+  }
+  .step-sublabel.active { color: rgba(255,255,255,.55); }
+
+  .rail-brand-tag {
+    margin: 0 20px 20px;
+    padding: 12px 14px;
+    background: rgba(255,255,255,.05);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255,255,255,.08);
+    display: none;
+  }
+  .rail-brand-tag.visible { display: block; }
+  .rail-brand-tag-label {
+    font-size: 10px; font-weight: 600; color: var(--slate-500);
+    text-transform: uppercase; letter-spacing: .8px; margin-bottom: 4px;
+  }
+  .rail-brand-tag-value {
+    font-size: 13px; font-weight: 700; color: var(--white);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .rail-brand-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--amber);
+  }
+
+  /* ── MAIN CONTENT ───────────────────────────── */
+  .main {
+    flex: 1;
+    background: var(--slate-50);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+  .topbar {
+    height: 56px;
+    background: var(--white);
+    border-bottom: 1px solid var(--slate-200);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 28px;
+    flex-shrink: 0;
+  }
+  .topbar-breadcrumb {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12.5px; color: var(--slate-400);
+  }
+  .topbar-breadcrumb span { color: var(--slate-700); font-weight: 600; }
+  .topbar-breadcrumb .sep { color: var(--slate-300); }
+  .topbar-actions { display: flex; align-items: center; gap: 10px; }
+  .topbar-pill {
+    padding: 4px 10px; border-radius: 20px;
+    font-size: 11px; font-weight: 600;
+    background: var(--amber-light); color: #92400E;
+  }
+  .topbar-avatar {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--blue) 0%, #7C3AED 100%);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: white;
+  }
+
+  .screen {
+    flex: 1; overflow: hidden;
+    display: none; flex-direction: column;
+    animation: screenIn .3s ease forwards;
+  }
+  .screen.active { display: flex; }
+
+  @keyframes screenIn {
+    from { opacity: 0; transform: translateX(18px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+
+  /* ── SCREEN: BRAND SELECT ───────────────────── */
+  .brand-screen {
+    align-items: center; justify-content: center;
+    padding: 32px;
+    gap: 0;
+  }
+  .brand-header { text-align: center; margin-bottom: 36px; }
+  .brand-header h1 {
+    font-size: 26px; font-weight: 800; color: var(--navy);
+    letter-spacing: -.5px; margin-bottom: 8px;
+  }
+  .brand-header p { font-size: 14px; color: var(--slate-500); line-height: 1.6; }
+
+  .brand-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 14px; width: 680px;
+  }
+  .brand-card {
+    background: var(--white);
+    border: 2px solid var(--slate-200);
+    border-radius: var(--radius-lg);
+    padding: 22px 18px;
+    cursor: pointer;
+    transition: all .2s;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+    position: relative; overflow: hidden;
+  }
+  .brand-card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--brand-color, var(--blue));
+    transform: scaleX(0); transform-origin: left;
+    transition: transform .25s;
+  }
+  .brand-card:hover { border-color: var(--slate-300); box-shadow: var(--shadow); transform: translateY(-2px); }
+  .brand-card:hover::before { transform: scaleX(1); }
+  .brand-card.selected { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.12), var(--shadow); }
+  .brand-card.selected::before { transform: scaleX(1); }
+
+  .brand-icon {
+    width: 42px; height: 42px; border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    background: var(--brand-bg, var(--blue-pale));
+  }
+  .brand-name { font-size: 15px; font-weight: 700; color: var(--slate-800); }
+  .brand-desc { font-size: 12px; color: var(--slate-500); line-height: 1.5; }
+  .brand-check {
+    position: absolute; top: 12px; right: 12px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--blue); display: none;
+    align-items: center; justify-content: center;
+    font-size: 11px; color: white;
+  }
+  .brand-card.selected .brand-check { display: flex; }
+
+  .brand-cta { margin-top: 28px; }
+
+  /* ── SCREEN: LOGIN ──────────────────────────── */
+  .login-screen {
+    align-items: center; justify-content: center;
+    padding: 32px;
+  }
+  .login-card {
+    background: var(--white);
+    border: 1px solid var(--slate-200);
+    border-radius: var(--radius-lg);
+    padding: 40px 40px 36px;
+    width: 420px;
+    box-shadow: var(--shadow-lg);
+  }
+  .login-brand-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--blue-pale); border: 1px solid var(--blue-border);
+    padding: 5px 12px; border-radius: 20px;
+    font-size: 12px; font-weight: 600; color: var(--blue);
+    margin-bottom: 20px;
+  }
+  .login-brand-badge-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); }
+  .login-title { font-size: 22px; font-weight: 800; color: var(--navy); margin-bottom: 6px; letter-spacing: -.3px; }
+  .login-sub { font-size: 13.5px; color: var(--slate-500); margin-bottom: 28px; }
+
+  .field-group { display: flex; flex-direction: column; gap: 16px; margin-bottom: 10px; }
+  .field-label {
+    font-size: 12px; font-weight: 600;
+    color: var(--slate-600); margin-bottom: 6px; display: block;
+    letter-spacing: .2px;
+  }
+  .field-input-wrap { position: relative; }
+  .field-input {
+    width: 100%; padding: 10px 14px;
+    border: 1.5px solid var(--slate-200);
+    border-radius: var(--radius-sm);
+    font-size: 14px; font-family: 'Inter', sans-serif;
+    color: var(--slate-800);
+    background: var(--white);
+    transition: border-color .2s, box-shadow .2s;
+    outline: none;
+  }
+  .field-input:focus {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(37,99,235,.1);
+  }
+  .field-input.has-icon { padding-left: 40px; }
+  .field-icon {
+    position: absolute; left: 13px; top: 50%;
+    transform: translateY(-50%); font-size: 15px;
+    color: var(--slate-400); pointer-events: none;
+  }
+  .field-eye {
+    position: absolute; right: 12px; top: 50%;
+    transform: translateY(-50%); font-size: 15px;
+    color: var(--slate-400); cursor: pointer;
+  }
+  .forgot-link {
+    text-align: right; margin-top: 6px;
+    font-size: 12px; color: var(--blue); cursor: pointer;
+    font-weight: 500;
+  }
+  .forgot-link:hover { text-decoration: underline; }
+
+  .forgot-banner {
+    display: none;
+    background: var(--blue-pale);
+    border: 1px solid var(--blue-border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    font-size: 13px; color: var(--blue);
+    margin-top: 10px;
+    align-items: center; gap: 8px;
+  }
+  .forgot-banner.show { display: flex; }
+
+  /* ── SCREEN: PRICING TYPE ───────────────────── */
+  .ptype-screen {
+    align-items: center; justify-content: center; padding: 32px;
+  }
+  .ptype-header { text-align: center; margin-bottom: 36px; }
+  .ptype-header h1 { font-size: 24px; font-weight: 800; color: var(--navy); letter-spacing: -.4px; margin-bottom: 8px; }
+  .ptype-header p { font-size: 14px; color: var(--slate-500); }
+
+  .ptype-cards {
+    display: flex; gap: 20px;
+  }
+  .ptype-card {
+    width: 280px;
+    background: var(--white);
+    border: 2px solid var(--slate-200);
+    border-radius: var(--radius-lg);
+    padding: 28px 24px;
+    cursor: pointer;
+    transition: all .22s;
+    display: flex; flex-direction: column; gap: 12px;
+    position: relative; overflow: hidden;
+  }
+  .ptype-card:hover { border-color: var(--slate-300); box-shadow: var(--shadow); transform: translateY(-2px); }
+  .ptype-card.selected { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.12), var(--shadow-lg); }
+  .ptype-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 10px; border-radius: 20px;
+    font-size: 11px; font-weight: 700;
+    background: var(--slate-100); color: var(--slate-500);
+    width: fit-content;
+  }
+  .ptype-card.selected .ptype-badge { background: var(--blue-pale); color: var(--blue); }
+  .ptype-card-icon {
+    font-size: 32px; margin-bottom: 2px;
+  }
+  .ptype-card h3 { font-size: 17px; font-weight: 800; color: var(--navy); letter-spacing: -.2px; }
+  .ptype-card p { font-size: 13px; color: var(--slate-500); line-height: 1.6; }
+  .ptype-features { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; }
+  .ptype-feat {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12.5px; color: var(--slate-600);
+  }
+  .ptype-feat-dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--blue); flex-shrink: 0;
+  }
+
+  .ptype-divider {
+    width: 1px; background: var(--slate-200);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--slate-400); font-size: 12px; font-weight: 600;
+    position: relative;
+  }
+  .ptype-divider::before {
+    content: 'OR';
+    background: var(--slate-50);
+    padding: 6px;
+    border: 1px solid var(--slate-200);
+    border-radius: 20px;
+    font-size: 10px;
+  }
+
+  /* B-Type sub-options */
+  .btype-subscreen {
+    display: none;
+    flex-direction: column; align-items: center;
+    gap: 0; width: 100%; padding: 0 32px 32px;
+    animation: screenIn .3s ease forwards;
+  }
+  .btype-subscreen.active { display: flex; }
+  .btype-header { text-align: center; margin-bottom: 24px; padding-top: 8px; }
+  .btype-header h2 { font-size: 19px; font-weight: 800; color: var(--navy); margin-bottom: 4px; }
+  .btype-header p { font-size: 13px; color: var(--slate-500); }
+  .btype-options { display: flex; gap: 20px; width: 100%; max-width: 780px; }
+  .btype-option {
+    flex: 1;
+    background: var(--white);
+    border: 2px solid var(--slate-200);
+    border-radius: var(--radius-lg);
+    padding: 22px 20px;
+    cursor: pointer;
+    transition: all .2s;
+    position: relative; overflow: hidden;
+  }
+  .btype-option::before {
+    content: '';
+    position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    background: var(--blue); transform: scaleY(0); transform-origin: bottom;
+    transition: transform .25s;
+  }
+  .btype-option:hover { border-color: var(--slate-300); box-shadow: var(--shadow); }
+  .btype-option:hover::before { transform: scaleY(1); }
+  .btype-option.selected { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+  .btype-option.selected::before { transform: scaleY(1); }
+  .btype-opt-label { font-size: 11px; font-weight: 700; color: var(--slate-400); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 10px; }
+  .btype-opt-title { font-size: 15px; font-weight: 800; color: var(--navy); margin-bottom: 6px; }
+  .btype-opt-desc { font-size: 12.5px; color: var(--slate-500); line-height: 1.5; margin-bottom: 14px; }
+  .btype-preview {
+    background: var(--slate-50); border: 1px solid var(--slate-200);
+    border-radius: var(--radius-sm); padding: 12px 14px;
+    font-size: 11.5px; color: var(--slate-600);
+  }
+  .btype-preview-title { font-weight: 700; color: var(--slate-700); margin-bottom: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .mock-master-select {
+    background: var(--white); border: 1.5px solid var(--blue-border);
+    border-radius: 6px; padding: 6px 10px;
+    font-size: 11px; color: var(--blue);
+    font-weight: 600; margin-bottom: 8px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .mock-sub-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+  .mock-input-block {
+    background: var(--white); border: 1px solid var(--slate-200);
+    border-radius: 5px; padding: 5px 8px;
+    font-size: 10px; color: var(--slate-500);
+  }
+  .mock-tabs {
+    display: flex; gap: 5px; margin-bottom: 8px;
+  }
+  .mock-tab {
+    flex: 1; padding: 5px 6px; border-radius: 5px;
+    font-size: 10px; font-weight: 600; text-align: center;
+    background: var(--slate-100); color: var(--slate-500);
+  }
+  .mock-tab.active-tab { background: var(--blue); color: white; }
+  .mock-shared-row {
+    display: flex; gap: 5px; margin-bottom: 5px;
+  }
+  .mock-shared-chip {
+    padding: 3px 7px; border-radius: 4px; font-size: 9.5px; font-weight: 600;
+    background: var(--amber-light); color: #92400E; border: 1px solid #FDE68A;
+  }
+
+  /* ── SCREEN: FORM (TYPE A) ──────────────────── */
+  .form-screen {
+    display: flex; flex-direction: column;
+    height: 100%;
+  }
+  .form-body {
+    flex: 1; overflow: hidden;
+    display: grid; grid-template-columns: 1fr 320px;
+    gap: 0;
+  }
+  .form-left {
+    padding: 24px 28px;
+    overflow-y: auto;
+    border-right: 1px solid var(--slate-200);
+  }
+  .form-section-title {
+    font-size: 13px; font-weight: 700; color: var(--slate-700);
+    margin-bottom: 16px; padding-bottom: 10px;
+    border-bottom: 1px solid var(--slate-200);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .form-section-title-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--blue);
+  }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .form-grid.single { grid-template-columns: 1fr; }
+  .input-block { display: flex; flex-direction: column; }
+  .input-block label { font-size: 12px; font-weight: 600; color: var(--slate-600); margin-bottom: 6px; }
+  .input-block input, .input-block select {
+    padding: 9px 13px;
+    border: 1.5px solid var(--slate-200);
+    border-radius: var(--radius-sm);
+    font-size: 13.5px; font-family: 'Inter', sans-serif;
+    color: var(--slate-800); background: var(--white);
+    outline: none; transition: border-color .2s, box-shadow .2s;
+    appearance: none;
+  }
+  .input-block input:focus, .input-block select:focus {
+    border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.1);
+  }
+  .input-block input.master-field {
+    border-color: var(--blue-border);
+    background: var(--blue-pale);
+    font-weight: 600; color: var(--blue);
+  }
+  .master-label {
+    display: flex; align-items: center; gap: 6px;
+  }
+  .master-tag {
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 4px;
+    background: var(--blue-pale); color: var(--blue); border: 1px solid var(--blue-border);
+    letter-spacing: .5px;
+  }
+  .input-hint {
+    font-size: 11px; color: var(--slate-400); margin-top: 4px;
+  }
+  .select-wrap { position: relative; }
+  .select-wrap::after {
+    content: '▾'; position: absolute; right: 12px; top: 50%;
+    transform: translateY(-50%); pointer-events: none;
+    color: var(--slate-400); font-size: 12px;
+  }
+
+  /* right panel */
+  .form-right {
+    display: flex; flex-direction: column;
+    background: var(--white);
+  }
+  .price-panel {
+    padding: 22px 22px 18px;
+    flex: 1;
+  }
+  .price-panel-title {
+    font-size: 11px; font-weight: 700; color: var(--slate-400);
+    text-transform: uppercase; letter-spacing: .8px; margin-bottom: 18px;
+  }
+  .price-main {
+    margin-bottom: 18px;
+  }
+  .price-label { font-size: 12px; color: var(--slate-500); margin-bottom: 4px; }
+  .price-value {
+    font-size: 36px; font-weight: 800; color: var(--navy);
+    font-family: 'JetBrains Mono', monospace; letter-spacing: -1px;
+  }
+  .price-value span { font-size: 18px; font-weight: 500; color: var(--slate-400); }
+  .price-breakdown {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 14px 16px;
+    background: var(--slate-50); border-radius: var(--radius-sm);
+    border: 1px solid var(--slate-200); margin-bottom: 18px;
+  }
+  .price-row {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 12.5px;
+  }
+  .price-row-label { color: var(--slate-600); }
+  .price-row-val { font-weight: 600; color: var(--slate-800); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .price-divider { height: 1px; background: var(--slate-200); }
+  .price-row.total .price-row-label { font-weight: 700; color: var(--slate-800); }
+  .price-row.total .price-row-val { color: var(--blue); font-size: 14px; }
+  .price-tag-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .price-tag {
+    padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;
+  }
+  .price-tag.green { background: var(--green-light); color: #065F46; }
+  .price-tag.amber { background: var(--amber-light); color: #92400E; }
+
+  /* notes footer */
+  .notes-footer {
+    padding: 14px 22px;
+    border-top: 1px solid var(--slate-200);
+    background: var(--white);
+  }
+  .notes-title {
+    font-size: 10.5px; font-weight: 700; color: var(--slate-400);
+    text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .notes-icon { font-size: 11px; }
+  .notes-list { display: flex; flex-direction: column; gap: 5px; }
+  .note-item {
+    font-size: 11.5px; color: var(--slate-600); line-height: 1.4;
+    display: flex; align-items: flex-start; gap: 6px;
+  }
+  .note-item::before {
+    content: '•'; color: var(--blue); font-size: 14px; line-height: 1; flex-shrink: 0;
+  }
+
+  /* form bottom bar */
+  .form-bottombar {
+    flex-shrink: 0;
+    height: 60px;
+    background: var(--white);
+    border-top: 1px solid var(--slate-200);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 28px;
+  }
+  .form-bottombar-left { font-size: 12px; color: var(--slate-500); }
+  .form-bottombar-left strong { color: var(--slate-700); }
+
+  /* ── SCREEN: FORM B1 (Master Input) ─────────── */
+  .formB1-screen { display: flex; flex-direction: column; height: 100%; }
+  .master-bar {
+    background: var(--navy);
+    padding: 14px 28px;
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 20px;
+  }
+  .master-bar-label {
+    font-size: 11px; font-weight: 700; color: rgba(255,255,255,.5);
+    text-transform: uppercase; letter-spacing: .8px; white-space: nowrap;
+  }
+  .master-bar-select {
+    flex: 1; max-width: 320px;
+    padding: 8px 14px;
+    background: rgba(255,255,255,.1);
+    border: 1.5px solid rgba(255,255,255,.2);
+    border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 600; color: white;
+    font-family: 'Inter', sans-serif;
+    outline: none; appearance: none;
+    cursor: pointer;
+  }
+  .master-bar-select option { background: var(--navy); color: white; }
+  .master-bar-indicator {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 20px;
+    background: rgba(37,99,235,.3); border: 1px solid rgba(37,99,235,.5);
+  }
+  .master-bar-indicator-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue-light); }
+  .master-bar-indicator-text { font-size: 11.5px; color: rgba(255,255,255,.8); font-weight: 600; }
+
+  /* ── SCREEN: FORM B2 (Tabbed) ────────────────── */
+  .formB2-screen { display: flex; flex-direction: column; height: 100%; }
+  .tab-nav {
+    background: var(--white);
+    border-bottom: 1px solid var(--slate-200);
+    display: flex; padding: 0 28px;
+    flex-shrink: 0;
+  }
+  .tab-btn {
+    padding: 0 18px; height: 48px;
+    display: flex; align-items: center; gap: 7px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    color: var(--slate-500);
+    border-bottom: 2.5px solid transparent;
+    transition: all .2s;
+    white-space: nowrap;
+  }
+  .tab-btn:hover { color: var(--slate-800); }
+  .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+  .tab-btn-icon { font-size: 14px; }
+  .tab-shared-badge {
+    font-size: 9.5px; font-weight: 700;
+    padding: 2px 6px; border-radius: 4px;
+    background: var(--amber-light); color: #92400E;
+    text-transform: uppercase; letter-spacing: .4px;
+  }
+  .shared-row {
+    background: linear-gradient(90deg, rgba(245,158,11,.07) 0%, transparent 100%);
+    border: 1px solid rgba(245,158,11,.25);
+    border-radius: var(--radius-sm);
+    padding: 12px 16px; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .shared-row-label {
+    font-size: 11px; font-weight: 700; color: #92400E;
+    text-transform: uppercase; letter-spacing: .5px;
+    white-space: nowrap;
+  }
+  .shared-row-inputs { display: flex; gap: 14px; flex: 1; }
+  .shared-input-wrap { flex: 1; }
+  .shared-input-wrap label { font-size: 11px; font-weight: 600; color: var(--slate-500); display: block; margin-bottom: 4px; }
+  .shared-input-wrap input {
+    width: 100%; padding: 8px 12px;
+    border: 1.5px solid rgba(245,158,11,.3); border-radius: 7px;
+    font-size: 13px; font-family: 'Inter', sans-serif;
+    background: rgba(245,158,11,.04); color: var(--slate-800); outline: none;
+    transition: border-color .2s;
+  }
+  .shared-input-wrap input:focus { border-color: var(--amber); box-shadow: 0 0 0 3px rgba(245,158,11,.1); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── BUTTONS ────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 10px 22px;
+    border-radius: var(--radius-sm);
+    font-size: 13.5px; font-weight: 700; font-family: 'Inter', sans-serif;
+    cursor: pointer; border: none; transition: all .18s;
+    letter-spacing: -.1px;
+  }
+  .btn-primary {
+    background: var(--blue); color: white;
+    box-shadow: 0 2px 8px rgba(37,99,235,.3);
+  }
+  .btn-primary:hover { background: #1D4ED8; box-shadow: 0 4px 14px rgba(37,99,235,.4); transform: translateY(-1px); }
+  .btn-primary:active { transform: translateY(0); }
+  .btn-ghost {
+    background: transparent; color: var(--slate-600);
+    border: 1.5px solid var(--slate-200);
+  }
+  .btn-ghost:hover { border-color: var(--slate-300); background: var(--slate-50); color: var(--slate-800); }
+  .btn-sm { padding: 7px 14px; font-size: 12.5px; }
+  .btn-icon { font-size: 15px; }
+  .btn-full { width: 100%; }
+  .btn:disabled { opacity: .45; pointer-events: none; }
+
+  /* ── MISC UTILITY ───────────────────────────── */
+  .mt-16 { margin-top: 16px; }
+  .mt-20 { margin-top: 20px; }
+  .flex-between { display: flex; align-items: center; justify-content: space-between; }
+  .text-muted { color: var(--slate-500); font-size: 12.5px; }
+  .gap-8 { gap: 8px; }
+  .flex { display: flex; }
+  .items-center { align-items: center; }
+
+  /* ── BACK BUTTON ────────────────────────────── */
+  .back-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; color: var(--slate-500);
+    cursor: pointer; padding: 4px 0;
+    transition: color .2s;
+    background: none; border: none;
+    font-family: 'Inter', sans-serif;
+  }
+  .back-btn:hover { color: var(--blue); }
+
+  /* ── SECTION DIVIDER ────────────────────────── */
+  .sec-divider { height: 1px; background: var(--slate-200); margin: 18px 0; }
+
+  /* TYPEFORM B sub-navigation */
+  .sub-back-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 28px 0;
+  }
+
+  /* Animated price update */
+  .price-value.updating {
+    animation: priceFlash .4s ease;
+  }
+  @keyframes priceFlash {
+    0% { opacity: 1; }
+    30% { opacity: .3; color: var(--blue); }
+    100% { opacity: 1; }
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--slate-300); border-radius: 10px; }
+
+  /* ── WINDOW CHROME ──────────────────────────── */
+  .window-chrome {
+    position: absolute; top: 0; left: 0; right: 0; height: 36px;
+    background: var(--navy);
+    border-radius: 20px 20px 0 0;
+    display: flex; align-items: center; padding: 0 16px;
+    z-index: 10;
+  }
+  .window-dots { display: flex; gap: 6px; }
+  .window-dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    cursor: pointer; transition: opacity .15s;
+  }
+  .window-dot:hover { opacity: .8; }
+  .window-dot.red { background: #FF5F56; }
+  .window-dot.amber { background: #FFBD2E; }
+  .window-dot.green { background: #27C93F; }
+  .window-title {
+    flex: 1; text-align: center; font-size: 12px; font-weight: 500;
+    color: rgba(255,255,255,.45); letter-spacing: .2px;
+    pointer-events: none;
+  }
+
+  /* Adjust rail for chrome */
+  .rail { padding-top: 36px; }
+  .main { padding-top: 36px; }
+  .window-chrome { left: 0; width: 100%; }
+
+  /* B type toggle in ptype screen */
+  .btype-toggle-area {
+    display: none;
+    padding: 20px 32px 0;
+    flex-direction: column; align-items: center;
+  }
+  .btype-toggle-area.show { display: flex; }
+  .btype-toggle-label {
+    font-size: 12px; font-weight: 600; color: var(--slate-500);
+    margin-bottom: 14px; text-align: center;
+  }
+  .btype-toggle-label strong { color: var(--blue); }
+  .btype-btns { display: flex; gap: 10px; }
+
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Window Chrome -->
+  <div class="window-chrome">
+    <div class="window-dots">
+      <div class="window-dot red"></div>
+      <div class="window-dot amber"></div>
+      <div class="window-dot green"></div>
+    </div>
+    <div class="window-title" id="windowTitle">PriceIQ — Pricing Calculator</div>
+  </div>
+
+  <!-- LEFT RAIL -->
+  <div class="rail">
+    <div class="rail-logo">
+      <div class="rail-logo-icon">⚡</div>
+      <div class="rail-logo-text">Price<span>IQ</span></div>
+    </div>
+    <div class="rail-steps" id="railSteps">
+      <!-- Steps injected by JS -->
+    </div>
+    <div class="rail-brand-tag" id="railBrandTag">
+      <div class="rail-brand-tag-label">Active Brand</div>
+      <div class="rail-brand-tag-value">
+        <div class="rail-brand-dot"></div>
+        <span id="railBrandName">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-breadcrumb" id="breadcrumb">PriceIQ <span class="sep">›</span> <span>Select Brand</span></div>
+      <div class="topbar-actions" id="topbarActions">
+        <div class="topbar-pill" id="versionPill">v2.4.1</div>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 1: BRAND ─────────────────────────── -->
+    <div class="screen active brand-screen" id="screenBrand">
+      <div class="brand-header">
+        <h1>Select Your Brand</h1>
+        <p>Each brand has its own pricing structure and rules.<br>Choose the brand you're calculating for.</p>
+      </div>
+      <div class="brand-grid">
+        <div class="brand-card" style="--brand-color:#2563EB;--brand-bg:#EFF6FF" onclick="selectBrand(this,'Nexus Corp','🔷')" data-brand="Nexus Corp">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🔷</div>
+          <div class="brand-name">Nexus Corp</div>
+          <div class="brand-desc">Industrial & infrastructure pricing with tier-based discounts</div>
+        </div>
+        <div class="brand-card" style="--brand-color:#7C3AED;--brand-bg:#F5F3FF" onclick="selectBrand(this,'Vertex Solutions','🟣')" data-brand="Vertex Solutions">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🟣</div>
+          <div class="brand-name">Vertex Solutions</div>
+          <div class="brand-desc">Software & SaaS licensing with usage-based metrics</div>
+        </div>
+        <div class="brand-card" style="--brand-color:#059669;--brand-bg:#ECFDF5" onclick="selectBrand(this,'Meridian Group','🟢')" data-brand="Meridian Group">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🟢</div>
+          <div class="brand-name">Meridian Group</div>
+          <div class="brand-desc">Consulting & professional services with resource models</div>
+        </div>
+        <div class="brand-card" style="--brand-color:#DC2626;--brand-bg:#FEF2F2" onclick="selectBrand(this,'Apex Industries','🔴')" data-brand="Apex Industries">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🔴</div>
+          <div class="brand-name">Apex Industries</div>
+          <div class="brand-desc">Manufacturing & supply chain with volume-based rates</div>
+        </div>
+        <div class="brand-card" style="--brand-color:#D97706;--brand-bg:#FFFBEB" onclick="selectBrand(this,'Orion Capital','🟡')" data-brand="Orion Capital">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🟡</div>
+          <div class="brand-name">Orion Capital</div>
+          <div class="brand-desc">Financial services & investment product pricing</div>
+        </div>
+        <div class="brand-card" style="--brand-color:#0E7490;--brand-bg:#ECFEFF" onclick="selectBrand(this,'Polaris Tech','🔵')" data-brand="Polaris Tech">
+          <div class="brand-check">✓</div>
+          <div class="brand-icon">🔵</div>
+          <div class="brand-name">Polaris Tech</div>
+          <div class="brand-desc">Deep tech & hardware with modular component pricing</div>
+        </div>
+      </div>
+      <div class="brand-cta">
+        <button class="btn btn-primary" id="brandContinue" disabled onclick="goTo('login')">
+          <span>Continue</span> <span class="btn-icon">→</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 2: LOGIN ─────────────────────────── -->
+    <div class="screen" id="screenLogin">
+      <div class="login-screen" style="display:flex;align-items:center;justify-content:center;flex:1">
+        <div class="login-card">
+          <div class="login-brand-badge">
+            <div class="login-brand-badge-dot"></div>
+            <span id="loginBrandName">Brand</span>
+          </div>
+          <div class="login-title">Welcome back</div>
+          <div class="login-sub">Sign in to access the pricing calculator</div>
+          <div class="field-group">
+            <div>
+              <label class="field-label">Employee ID</label>
+              <div class="field-input-wrap">
+                <span class="field-icon">👤</span>
+                <input class="field-input has-icon" type="text" placeholder="EMP-00000" id="loginId">
+              </div>
+            </div>
+            <div>
+              <label class="field-label">Password</label>
+              <div class="field-input-wrap">
+                <span class="field-icon">🔒</span>
+                <input class="field-input has-icon" type="password" placeholder="Enter your password" id="loginPass" style="padding-right:40px">
+                <span class="field-eye" onclick="togglePass()">👁</span>
+              </div>
+              <div class="forgot-link" onclick="showForgot()">Forgot password?</div>
+            </div>
+          </div>
+          <div class="forgot-banner" id="forgotBanner">
+            <span>📨</span>
+            <span>A reset link will be sent to your registered email. Contact IT if you don't receive it within 5 minutes.</span>
+          </div>
+          <div class="mt-20" style="display:flex;flex-direction:column;gap:10px">
+            <button class="btn btn-primary btn-full" onclick="goTo('ptype')">
+              <span>Sign In</span> <span class="btn-icon">→</span>
+            </button>
+            <button class="btn btn-ghost btn-full btn-sm" onclick="goTo('brand')">← Change Brand</button>
+          </div>
+          <div class="mt-16 text-muted" style="text-align:center;font-size:11.5px">
+            Having trouble? Contact <strong style="color:var(--blue)">IT Support</strong> · ext. 2100
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 3: PRICING TYPE ──────────────────── -->
+    <div class="screen" id="screenPtype">
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+        <!-- Type selection -->
+        <div id="ptypeSelect" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px 32px;flex:1">
+          <div class="ptype-header">
+            <h1>Select Pricing Type</h1>
+            <p>Choose the pricing method applicable for this deal</p>
+          </div>
+          <div class="ptype-cards">
+            <div class="ptype-card" id="ptypeA" onclick="selectPtype('A')">
+              <div class="ptype-badge">⬡ Type A</div>
+              <div class="ptype-card-icon">📊</div>
+              <h3>Standard Pricing</h3>
+              <p>Fixed-form pricing with six configurable parameters. Best for straightforward, repeatable deal structures.</p>
+              <div class="ptype-features">
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>Single unified form</div>
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>6 structured inputs</div>
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>Instant price output</div>
+              </div>
+            </div>
+            <div class="ptype-divider"></div>
+            <div class="ptype-card" id="ptypeB" onclick="selectPtype('B')">
+              <div class="ptype-badge">◈ Type B</div>
+              <div class="ptype-card-icon">⚙️</div>
+              <h3>Dynamic Pricing</h3>
+              <p>Master-driven pricing where one key input dynamically configures the rest. Best for complex, variable deals.</p>
+              <div class="ptype-features">
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>Master-controlled logic</div>
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>Adaptive sub-inputs</div>
+                <div class="ptype-feat"><div class="ptype-feat-dot"></div>Shared input support</div>
+              </div>
+            </div>
+          </div>
+          <!-- B Sub-options (shown when B selected) -->
+          <div class="btype-toggle-area" id="btypeToggle">
+            <div class="btype-toggle-label">Type B has two layout modes. <strong>Which UI pattern fits your workflow?</strong></div>
+            <div class="btype-btns">
+              <button class="btn btn-ghost btn-sm" onclick="launchForm('B1')">⬇ Master Dropdown Model</button>
+              <button class="btn btn-ghost btn-sm" onclick="launchForm('B2')">📑 Tabbed Sections Model</button>
+              <button class="btn btn-primary btn-sm" style="margin-left:6px" onclick="showBCompare()">Compare Both →</button>
+            </div>
+          </div>
+          <div id="ptypeContinue" style="margin-top:24px;display:none">
+            <button class="btn btn-primary" onclick="launchForm('A')">
+              Continue with Type A <span class="btn-icon">→</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- B Comparison View (inside same screen) -->
+        <div id="bCompareView" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+          <div class="sub-back-bar">
+            <button class="back-btn" onclick="hideBCompare()">← Back to Type Selection</button>
+            <div style="font-size:12px;color:var(--slate-500)">Type B — Choose a layout model</div>
+          </div>
+          <div style="display:flex;gap:0;flex:1;overflow:hidden;padding:16px 28px 24px">
+            <!-- B1 Option -->
+            <div class="btype-option" id="bopt1" onclick="selectBOpt('B1')" style="flex:1;margin-right:12px">
+              <div class="btype-opt-label">Option B1</div>
+              <div class="btype-opt-title">Master Dropdown Model</div>
+              <div class="btype-opt-desc">One master selector at the top that dynamically reveals and adjusts the sub-inputs below. Ideal when each configuration shares the same input structure but with different values/constraints.</div>
+              <div class="btype-preview">
+                <div class="btype-preview-title">UI Preview</div>
+                <div class="mock-master-select">Product Category: Enterprise License <span>▾</span></div>
+                <div class="mock-sub-inputs">
+                  <div class="mock-input-block">Units (min 100)</div>
+                  <div class="mock-input-block">Term (1–5 yrs)</div>
+                  <div class="mock-input-block">Region ▾</div>
+                  <div class="mock-input-block">Discount %</div>
+                </div>
+              </div>
+              <div style="margin-top:14px">
+                <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();launchForm('B1')">Use This Model →</button>
+              </div>
+            </div>
+            <!-- B2 Option -->
+            <div class="btype-option" id="bopt2" onclick="selectBOpt('B2')" style="flex:1">
+              <div class="btype-opt-label">Option B2</div>
+              <div class="btype-opt-title">Tabbed Sections Model</div>
+              <div class="btype-opt-desc">Each pricing category gets its own tab with a dedicated form. Shared inputs (e.g., Region, Client Tier) are pinned at the top and synced across all tabs — eliminating redundant entry.</div>
+              <div class="btype-preview">
+                <div class="btype-preview-title">UI Preview</div>
+                <div class="mock-tabs">
+                  <div class="mock-tab active-tab">Software</div>
+                  <div class="mock-tab">Hardware</div>
+                  <div class="mock-tab">Support</div>
+                </div>
+                <div class="mock-shared-row" style="display:flex;gap:5px;margin-bottom:6px">
+                  <div class="mock-shared-chip">Shared</div>
+                  <div class="mock-input-block" style="flex:1">Region: APAC</div>
+                  <div class="mock-input-block" style="flex:1">Tier: Gold</div>
+                </div>
+                <div class="mock-sub-inputs">
+                  <div class="mock-input-block">Licenses</div>
+                  <div class="mock-input-block">Modules</div>
+                </div>
+              </div>
+              <div style="margin-top:14px">
+                <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();launchForm('B2')">Use This Model →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 4A: FORM TYPE A ──────────────────── -->
+    <div class="screen" id="screenFormA">
+      <div class="form-screen">
+        <div class="sub-back-bar" style="padding-bottom:12px">
+          <button class="back-btn" onclick="goTo('ptype')">← Back to Pricing Type</button>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="font-size:12px;color:var(--slate-500)">Type A — Standard Pricing</div>
+            <div class="topbar-pill" style="font-size:11px">Type A</div>
+          </div>
+        </div>
+        <div class="form-body">
+          <div class="form-left">
+            <div class="form-section-title"><div class="form-section-title-dot"></div>Pricing Parameters</div>
+            <div class="form-grid">
+              <div class="input-block">
+                <label><span class="master-label">Product Category <span class="master-tag">Master</span></span></label>
+                <div class="select-wrap">
+                  <select class="master-field" oninput="recalcPrice()" style="width:100%;padding:9px 13px;border:1.5px solid var(--blue-border);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;background:var(--blue-pale);color:var(--blue);font-weight:600;outline:none;appearance:none">
+                    <option>Enterprise License</option>
+                    <option>Professional Suite</option>
+                    <option>Starter Pack</option>
+                  </select>
+                </div>
+                <div class="input-hint">Drives base rate & constraints</div>
+              </div>
+              <div class="input-block">
+                <label>Client Tier</label>
+                <div class="select-wrap">
+                  <select oninput="recalcPrice()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none">
+                    <option>Gold</option>
+                    <option>Silver</option>
+                    <option>Platinum</option>
+                    <option>Standard</option>
+                  </select>
+                </div>
+              </div>
+              <div class="input-block">
+                <label>Unit Volume</label>
+                <input type="number" value="250" min="1" oninput="recalcPrice()" placeholder="e.g. 250">
+                <div class="input-hint">Units purchased</div>
+              </div>
+              <div class="input-block">
+                <label>Contract Term (months)</label>
+                <input type="number" value="24" min="1" max="60" oninput="recalcPrice()" placeholder="e.g. 24">
+                <div class="input-hint">1–60 months</div>
+              </div>
+              <div class="input-block">
+                <label>Region / Territory</label>
+                <div class="select-wrap">
+                  <select oninput="recalcPrice()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none">
+                    <option>APAC</option><option>EMEA</option><option>NAM</option><option>LATAM</option>
+                  </select>
+                </div>
+              </div>
+              <div class="input-block">
+                <label>Manual Discount (%)</label>
+                <input type="number" value="5" min="0" max="40" oninput="recalcPrice()" placeholder="0–40">
+                <div class="input-hint">Max 40% allowed</div>
+              </div>
+            </div>
+          </div>
+          <!-- Right Panel -->
+          <div class="form-right">
+            <div class="price-panel">
+              <div class="price-panel-title">Price Summary</div>
+              <div class="price-main">
+                <div class="price-label">Estimated Total</div>
+                <div class="price-value" id="priceMainA"><span>$</span>148,500</div>
+              </div>
+              <div class="price-breakdown">
+                <div class="price-row">
+                  <span class="price-row-label">Base Rate</span>
+                  <span class="price-row-val" id="baseRateA">$650/unit</span>
+                </div>
+                <div class="price-row">
+                  <span class="price-row-label">Units × Term</span>
+                  <span class="price-row-val" id="unitsTermA">250 × 24</span>
+                </div>
+                <div class="price-row">
+                  <span class="price-row-label">Tier Discount</span>
+                  <span class="price-row-val" style="color:var(--green)" id="tierDiscA">−10%</span>
+                </div>
+                <div class="price-row">
+                  <span class="price-row-label">Manual Discount</span>
+                  <span class="price-row-val" style="color:var(--green)" id="manualDiscA">−5%</span>
+                </div>
+                <div class="price-divider"></div>
+                <div class="price-row total">
+                  <span class="price-row-label">Total Payable</span>
+                  <span class="price-row-val" id="totalRowA">$148,500</span>
+                </div>
+              </div>
+              <div class="price-tag-row">
+                <div class="price-tag green">✓ Within policy</div>
+                <div class="price-tag amber">⚠ Review &gt;30% disc</div>
+              </div>
+            </div>
+            <div class="notes-footer">
+              <div class="notes-title"><span class="notes-icon">📋</span> Fixed Notes</div>
+              <div class="notes-list">
+                <div class="note-item">Platinum tier unlocks up to 40% total discount</div>
+                <div class="note-item">APAC region adds 2% surcharge on base rate</div>
+                <div class="note-item">Discounts above 30% require manager approval</div>
+                <div class="note-item">Pricing valid for 30 days from generation date</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="form-bottombar">
+          <div class="form-bottombar-left">Brand: <strong id="formABrand">—</strong> &nbsp;·&nbsp; Type A</div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-ghost btn-sm" onclick="goTo('ptype')">← Change Type</button>
+            <button class="btn btn-primary btn-sm" onclick="alert('Quote generated! Ref: QT-2026-'+Math.floor(Math.random()*9000+1000))">
+              Generate Quote ✓
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 4B1: FORM TYPE B1 (Master Dropdown) ── -->
+    <div class="screen" id="screenFormB1">
+      <div class="formB1-screen">
+        <!-- Master bar -->
+        <div class="master-bar">
+          <span class="master-bar-label">Master Input</span>
+          <select class="master-bar-select" id="masterB1" onchange="changeMasterB1()">
+            <option value="ent">Enterprise License</option>
+            <option value="pro">Professional Suite</option>
+            <option value="starter">Starter Pack</option>
+          </select>
+          <div class="master-bar-indicator">
+            <div class="master-bar-indicator-dot"></div>
+            <span class="master-bar-indicator-text" id="masterB1Indicator">3 sub-inputs active</span>
+          </div>
+          <button class="back-btn" style="color:rgba(255,255,255,.5);margin-left:auto" onclick="goTo('ptype')">← Back</button>
+        </div>
+        <!-- Form body same layout as A but with dynamic labels -->
+        <div class="form-body">
+          <div class="form-left">
+            <div class="form-section-title"><div class="form-section-title-dot"></div>Dynamic Parameters <span style="font-weight:400;color:var(--slate-400);font-size:11px;margin-left:4px">— driven by master selection above</span></div>
+            <div class="form-grid" id="b1FormGrid">
+              <div class="input-block">
+                <label id="b1l1">Seat Count</label>
+                <input type="number" value="100" placeholder="e.g. 100" oninput="recalcPriceB()" id="b1i1">
+                <div class="input-hint" id="b1h1">Min 50 for Enterprise</div>
+              </div>
+              <div class="input-block">
+                <label id="b1l2">Contract Term (months)</label>
+                <input type="number" value="36" placeholder="e.g. 36" oninput="recalcPriceB()" id="b1i2">
+              </div>
+              <div class="input-block">
+                <label id="b1l3">Region</label>
+                <div class="select-wrap">
+                  <select oninput="recalcPriceB()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none">
+                    <option>APAC</option><option>EMEA</option><option>NAM</option>
+                  </select>
+                </div>
+              </div>
+              <div class="input-block">
+                <label id="b1l4">Support Level</label>
+                <div class="select-wrap" id="b1w4">
+                  <select oninput="recalcPriceB()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none">
+                    <option>Premium 24/7</option><option>Business Hours</option><option>Email Only</option>
+                  </select>
+                </div>
+              </div>
+              <div class="input-block">
+                <label id="b1l5">Add-on Modules</label>
+                <input type="number" value="2" min="0" max="8" oninput="recalcPriceB()" id="b1i5">
+                <div class="input-hint" id="b1h5">0–8 modules</div>
+              </div>
+              <div class="input-block">
+                <label id="b1l6">Negotiated Discount (%)</label>
+                <input type="number" value="8" min="0" max="35" oninput="recalcPriceB()" id="b1i6">
+              </div>
+            </div>
+          </div>
+          <div class="form-right">
+            <div class="price-panel">
+              <div class="price-panel-title">Price Summary</div>
+              <div class="price-main">
+                <div class="price-label">Estimated Total</div>
+                <div class="price-value" id="priceMainB1"><span>$</span>189,200</div>
+              </div>
+              <div class="price-breakdown">
+                <div class="price-row"><span class="price-row-label">Category Rate</span><span class="price-row-val" id="b1Rate">$52/seat/mo</span></div>
+                <div class="price-row"><span class="price-row-label">Seats × Months</span><span class="price-row-val" id="b1Units">100 × 36</span></div>
+                <div class="price-row"><span class="price-row-label">Module Add-ons</span><span class="price-row-val" id="b1Mods">+$4,000</span></div>
+                <div class="price-row"><span class="price-row-label">Total Discount</span><span class="price-row-val" style="color:var(--green)" id="b1Disc">−8%</span></div>
+                <div class="price-divider"></div>
+                <div class="price-row total"><span class="price-row-label">Total Payable</span><span class="price-row-val" id="b1Total">$189,200</span></div>
+              </div>
+              <div class="price-tag-row">
+                <div class="price-tag green">✓ Approved rate</div>
+              </div>
+            </div>
+            <div class="notes-footer">
+              <div class="notes-title"><span class="notes-icon">📋</span> Fixed Notes</div>
+              <div class="notes-list">
+                <div class="note-item">Enterprise tier requires min 50 seats</div>
+                <div class="note-item">Modules priced at $2,000 each per year</div>
+                <div class="note-item">Discounts over 25% require VP approval</div>
+                <div class="note-item">Support level affects renewal rate by ±3%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="form-bottombar">
+          <div class="form-bottombar-left">Brand: <strong id="formB1Brand">—</strong> &nbsp;·&nbsp; Type B — Master Dropdown</div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-ghost btn-sm" onclick="goTo('ptype')">← Change Type</button>
+            <button class="btn btn-primary btn-sm" onclick="alert('Quote generated! Ref: QT-2026-'+Math.floor(Math.random()*9000+1000))">Generate Quote ✓</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SCREEN 4B2: FORM TYPE B2 (Tabbed) ─────────── -->
+    <div class="screen" id="screenFormB2">
+      <div class="formB2-screen">
+        <!-- Shared inputs row -->
+        <div style="padding:12px 28px 0;flex-shrink:0">
+          <div class="shared-row">
+            <div class="shared-row-label">⚡ Shared</div>
+            <div class="shared-row-inputs">
+              <div class="shared-input-wrap">
+                <label>Region / Territory</label>
+                <input type="text" value="APAC" oninput="recalcPriceB2()">
+              </div>
+              <div class="shared-input-wrap">
+                <label>Client Tier</label>
+                <input type="text" value="Gold" oninput="recalcPriceB2()">
+              </div>
+              <div class="shared-input-wrap">
+                <label>Contract Term (mo)</label>
+                <input type="number" value="24" oninput="recalcPriceB2()">
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- Tab nav -->
+        <div class="tab-nav" style="flex-shrink:0">
+          <div class="tab-btn active" onclick="switchTab(this,'tabSoftware')" id="tabBtnSoftware">
+            <span class="tab-btn-icon">💻</span> Software
+          </div>
+          <div class="tab-btn" onclick="switchTab(this,'tabHardware')" id="tabBtnHardware">
+            <span class="tab-btn-icon">🖥</span> Hardware
+          </div>
+          <div class="tab-btn" onclick="switchTab(this,'tabSupport')" id="tabBtnSupport">
+            <span class="tab-btn-icon">🛡</span> Support &amp; SLA
+          </div>
+          <div class="tab-btn" onclick="switchTab(this,'tabServices')" id="tabBtnServices">
+            <span class="tab-btn-icon">🔧</span> Services
+          </div>
+          <div style="flex:1"></div>
+          <button class="back-btn" style="margin:0 0 0 12px" onclick="goTo('ptype')">← Change Type</button>
+        </div>
+        <!-- Tab content area -->
+        <div style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+          <div style="flex:1;display:flex;overflow:hidden">
+            <div style="flex:1;overflow-y:auto;padding:18px 28px">
+
+              <div class="tab-content active" id="tabSoftware">
+                <div class="form-section-title"><div class="form-section-title-dot"></div>Software Licensing</div>
+                <div class="form-grid">
+                  <div class="input-block"><label>License Type</label>
+                    <div class="select-wrap"><select oninput="recalcPriceB2()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none"><option>Perpetual</option><option>Subscription</option><option>Concurrent</option></select></div>
+                  </div>
+                  <div class="input-block"><label>Seat Count</label><input type="number" value="150" oninput="recalcPriceB2()"><div class="input-hint">Min 10 seats</div></div>
+                  <div class="input-block"><label>Module Add-ons</label><input type="number" value="3" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Software Discount (%)</label><input type="number" value="10" oninput="recalcPriceB2()"></div>
+                </div>
+              </div>
+
+              <div class="tab-content" id="tabHardware">
+                <div class="form-section-title"><div class="form-section-title-dot"></div>Hardware Components</div>
+                <div class="form-grid">
+                  <div class="input-block"><label>Device Model</label>
+                    <div class="select-wrap"><select oninput="recalcPriceB2()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none"><option>ProStation X1</option><option>UltraDesk 3</option><option>MiniNode</option></select></div>
+                  </div>
+                  <div class="input-block"><label>Unit Quantity</label><input type="number" value="50" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Warranty Period (yr)</label><input type="number" value="3" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Hardware Discount (%)</label><input type="number" value="5" oninput="recalcPriceB2()"></div>
+                </div>
+              </div>
+
+              <div class="tab-content" id="tabSupport">
+                <div class="form-section-title"><div class="form-section-title-dot"></div>Support &amp; SLA</div>
+                <div class="form-grid">
+                  <div class="input-block"><label>SLA Tier</label>
+                    <div class="select-wrap"><select oninput="recalcPriceB2()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none"><option>Platinum 24/7</option><option>Gold Business</option><option>Silver Email</option></select></div>
+                  </div>
+                  <div class="input-block"><label>Covered Sites</label><input type="number" value="3" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Incident Cap / month</label><input type="number" value="20" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Support Discount (%)</label><input type="number" value="0" oninput="recalcPriceB2()"></div>
+                </div>
+              </div>
+
+              <div class="tab-content" id="tabServices">
+                <div class="form-section-title"><div class="form-section-title-dot"></div>Professional Services</div>
+                <div class="form-grid">
+                  <div class="input-block"><label>Engagement Type</label>
+                    <div class="select-wrap"><select oninput="recalcPriceB2()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none"><option>Implementation</option><option>Migration</option><option>Training</option></select></div>
+                  </div>
+                  <div class="input-block"><label>Resource Days</label><input type="number" value="15" oninput="recalcPriceB2()"></div>
+                  <div class="input-block"><label>Travel Included</label>
+                    <div class="select-wrap"><select oninput="recalcPriceB2()" style="width:100%;padding:9px 13px;border:1.5px solid var(--slate-200);border-radius:8px;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--slate-800);outline:none;appearance:none"><option>Yes</option><option>No</option></select></div>
+                  </div>
+                  <div class="input-block"><label>Services Discount (%)</label><input type="number" value="0" oninput="recalcPriceB2()"></div>
+                </div>
+              </div>
+
+            </div>
+            <!-- Right price panel -->
+            <div class="form-right" style="width:290px;flex-shrink:0;border-left:1px solid var(--slate-200)">
+              <div class="price-panel">
+                <div class="price-panel-title">Combined Summary</div>
+                <div class="price-main">
+                  <div class="price-label">Grand Total</div>
+                  <div class="price-value" id="priceMainB2"><span>$</span>312,400</div>
+                </div>
+                <div class="price-breakdown">
+                  <div class="price-row"><span class="price-row-label">Software</span><span class="price-row-val" id="b2sw">$184,000</span></div>
+                  <div class="price-row"><span class="price-row-label">Hardware</span><span class="price-row-val" id="b2hw">$95,000</span></div>
+                  <div class="price-row"><span class="price-row-label">Support</span><span class="price-row-val" id="b2sup">$24,000</span></div>
+                  <div class="price-row"><span class="price-row-label">Services</span><span class="price-row-val" id="b2svc">$18,750</span></div>
+                  <div class="price-divider"></div>
+                  <div class="price-row total"><span class="price-row-label">Grand Total</span><span class="price-row-val" id="b2Total">$312,400</span></div>
+                </div>
+                <div class="price-tag-row">
+                  <div class="price-tag green">✓ All sections complete</div>
+                </div>
+              </div>
+              <div class="notes-footer">
+                <div class="notes-title"><span class="notes-icon">📋</span> Fixed Notes</div>
+                <div class="notes-list">
+                  <div class="note-item">Shared fields apply to all tabs automatically</div>
+                  <div class="note-item">Gold tier grants 10% base discount per section</div>
+                  <div class="note-item">Combined discounts capped at 35%</div>
+                  <div class="note-item">Services not discountable over 15%</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="form-bottombar">
+            <div class="form-bottombar-left">Brand: <strong id="formB2Brand">—</strong> &nbsp;·&nbsp; Type B — Tabbed Sections</div>
+            <div style="display:flex;gap:10px">
+              <button class="btn btn-ghost btn-sm" onclick="goTo('ptype')">← Change Type</button>
+              <button class="btn btn-primary btn-sm" onclick="alert('Quote generated! Ref: QT-2026-'+Math.floor(Math.random()*9000+1000))">Generate Quote ✓</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script>
+// ── STATE ─────────────────────────────────────────
+let state = {
+  brand: null,
+  brandIcon: null,
+  currentScreen: 'brand',
+  pricingType: null,
+};
+
+const STEPS = [
+  { id: 'brand',  label: 'Brand Selection',  sub: 'Choose your brand' },
+  { id: 'login',  label: 'Authentication',   sub: 'Sign in securely' },
+  { id: 'ptype',  label: 'Pricing Type',     sub: 'Select A or B' },
+  { id: 'form',   label: 'Price Calculator', sub: 'Enter parameters' },
+];
+
+// ── RAIL RENDERING ────────────────────────────────
+function renderRail() {
+  const order = ['brand','login','ptype','form'];
+  const cur = state.currentScreen;
+  const curIdx = order.indexOf(cur === 'formA' || cur === 'formB1' || cur === 'formB2' ? 'form' : cur);
+  const stepsEl = document.getElementById('railSteps');
+  stepsEl.innerHTML = '';
+  STEPS.forEach((s, i) => {
+    const isDone = i < curIdx;
+    const isActive = i === curIdx;
+    const statusClass = isDone ? 'done' : isActive ? 'active' : 'idle';
+    const dotContent = isDone ? '✓' : (i + 1);
+    const connector = i < STEPS.length - 1
+      ? `<div class="step-connector ${isDone ? 'done' : ''}"></div>` : '';
+    stepsEl.innerHTML += `
+      <div class="step-item ${statusClass}" ${isDone ? `onclick="goTo('${s.id}')"` : ''}>
+        <div class="step-dot ${statusClass}">${dotContent}</div>
+        <div class="step-text">
+          <div class="step-label ${statusClass}">${s.label}</div>
+          <div class="step-sublabel ${statusClass}">${s.sub}</div>
+        </div>
+        ${connector}
+      </div>`;
+  });
+  // Brand tag
+  const tag = document.getElementById('railBrandTag');
+  const tagName = document.getElementById('railBrandName');
+  if (state.brand) {
+    tag.classList.add('visible');
+    tagName.textContent = state.brand;
+  } else {
+    tag.classList.remove('visible');
+  }
+}
+
+// ── NAVIGATION ────────────────────────────────────
+function goTo(screen) {
+  // Hide all screens
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  state.currentScreen = screen;
+
+  const screenMap = {
+    brand: 'screenBrand',
+    login: 'screenLogin',
+    ptype: 'screenPtype',
+    formA: 'screenFormA',
+    formB1: 'screenFormB1',
+    formB2: 'screenFormB2',
+  };
+
+  const target = document.getElementById(screenMap[screen]);
+  if (target) target.classList.add('active');
+
+  // Reset ptype screen state if navigating to it
+  if (screen === 'ptype') {
+    document.getElementById('bCompareView').style.display = 'none';
+    document.getElementById('ptypeSelect').style.display = 'flex';
+  }
+
+  // Update breadcrumb
+  const crumbs = {
+    brand: ['Brand Selection'],
+    login: ['Brand Selection', 'Sign In'],
+    ptype: ['Brand Selection', 'Sign In', 'Pricing Type'],
+    formA: ['Brand Selection', 'Sign In', 'Pricing Type', 'Type A'],
+    formB1: ['Brand Selection', 'Sign In', 'Pricing Type', 'Type B — Master'],
+    formB2: ['Brand Selection', 'Sign In', 'Pricing Type', 'Type B — Tabs'],
+  };
+  const bc = crumbs[screen] || [];
+  const bcEl = document.getElementById('breadcrumb');
+  if (bc.length > 0) {
+    bcEl.innerHTML = 'PriceIQ ' + bc.map((b, i) => `<span class="sep">›</span> ${i === bc.length - 1 ? '<span>' + b + '</span>' : b}`).join(' ');
+  }
+
+  // Update brand names in forms
+  if (state.brand) {
+    const els = ['loginBrandName','formABrand','formB1Brand','formB2Brand'];
+    els.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = state.brand; });
+  }
+
+  // Topbar avatar
+  if (screen !== 'brand' && screen !== 'login') {
+    const actions = document.getElementById('topbarActions');
+    if (!document.getElementById('topbarAvatarEl')) {
+      actions.innerHTML += `<div class="topbar-avatar" id="topbarAvatarEl">YO</div>`;
+    }
+  }
+
+  renderRail();
+}
+
+// ── BRAND SELECTION ───────────────────────────────
+function selectBrand(el, name, icon) {
+  document.querySelectorAll('.brand-card').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  state.brand = name;
+  state.brandIcon = icon;
+  document.getElementById('brandContinue').disabled = false;
+  renderRail();
+}
+
+// ── AUTH ──────────────────────────────────────────
+function togglePass() {
+  const p = document.getElementById('loginPass');
+  p.type = p.type === 'password' ? 'text' : 'password';
+}
+function showForgot() {
+  document.getElementById('forgotBanner').classList.toggle('show');
+}
+
+// ── PRICING TYPE ──────────────────────────────────
+function selectPtype(type) {
+  state.pricingType = type;
+  document.getElementById('ptypeA').classList.toggle('selected', type === 'A');
+  document.getElementById('ptypeB').classList.toggle('selected', type === 'B');
+  document.getElementById('ptypeContinue').style.display = type === 'A' ? 'block' : 'none';
+  document.getElementById('btypeToggle').classList.toggle('show', type === 'B');
+}
+
+function showBCompare() {
+  document.getElementById('ptypeSelect').style.display = 'none';
+  document.getElementById('bCompareView').style.display = 'flex';
+  document.getElementById('bCompareView').style.flexDirection = 'column';
+}
+function hideBCompare() {
+  document.getElementById('bCompareView').style.display = 'none';
+  document.getElementById('ptypeSelect').style.display = 'flex';
+}
+function selectBOpt(opt) {
+  document.getElementById('bopt1').classList.toggle('selected', opt === 'B1');
+  document.getElementById('bopt2').classList.toggle('selected', opt === 'B2');
+}
+
+function launchForm(type) {
+  goTo('form' + type);
+}
+
+// ── PRICE CALC A ──────────────────────────────────
+function recalcPrice() {
+  const baseRates = { 'Enterprise License': 650, 'Professional Suite': 480, 'Starter Pack': 290 };
+  const tierDiscs = { 'Platinum': .15, 'Gold': .10, 'Silver': .05, 'Standard': 0 };
+  const form = document.getElementById('screenFormA');
+  const selects = form.querySelectorAll('select');
+  const inputs = form.querySelectorAll('input[type="number"]');
+  const cat = selects[0]?.value || 'Enterprise License';
+  const tier = selects[1]?.value || 'Gold';
+  const units = parseInt(inputs[0]?.value) || 0;
+  const term = parseInt(inputs[1]?.value) || 0;
+  const manualDisc = Math.min(parseFloat(inputs[2]?.value) || 0, 40) / 100;
+  const tierDisc = tierDiscs[tier] || 0;
+  const rate = baseRates[cat] || 650;
+  const base = rate * units * (term / 12);
+  const total = base * (1 - tierDisc) * (1 - manualDisc);
+
+  const fmt = v => '$' + Math.round(v).toLocaleString();
+  const el = document.getElementById('priceMainA');
+  el.classList.add('updating');
+  setTimeout(() => el.classList.remove('updating'), 400);
+  el.innerHTML = `<span>$</span>${Math.round(total).toLocaleString()}`;
+  document.getElementById('baseRateA').textContent = `$${rate}/unit`;
+  document.getElementById('unitsTermA').textContent = `${units} × ${term}`;
+  document.getElementById('tierDiscA').textContent = `−${(tierDisc*100).toFixed(0)}%`;
+  document.getElementById('manualDiscA').textContent = `−${(manualDisc*100).toFixed(0)}%`;
+  document.getElementById('totalRowA').textContent = fmt(total);
+}
+
+// ── PRICE CALC B1 ─────────────────────────────────
+const B1_CONFIGS = {
+  ent:     { labels: ['Seat Count','Contract Term (mo)','Region','Support Level','Add-on Modules','Disc (%)'], hints: ['Min 50','','','','0–8',''], rate: 52, mod: 2000 },
+  pro:     { labels: ['User Licenses','Duration (mo)','Territory','Maintenance Tier','Feature Packs','Disc (%)'], hints: ['Min 10','','','','0–5',''], rate: 34, mod: 1200 },
+  starter: { labels: ['Named Users','Months','Area','Plan','Extras','Disc (%)'], hints: ['1–20','','','','0–3',''], rate: 18, mod: 500 },
+};
+function changeMasterB1() {
+  const val = document.getElementById('masterB1').value;
+  const cfg = B1_CONFIGS[val];
+  ['l1','l2','l3','l4','l5','l6'].forEach((id, i) => {
+    const el = document.getElementById('b1' + id);
+    if (el) el.textContent = cfg.labels[i];
+  });
+  ['h1','h5'].forEach((id, i) => {
+    const el = document.getElementById('b1' + id);
+    if (el) el.textContent = cfg.hints[i === 0 ? 0 : 5];
+  });
+  const count = val === 'ent' ? 3 : val === 'pro' ? 4 : 2;
+  document.getElementById('masterB1Indicator').textContent = `${count} key inputs active`;
+  recalcPriceB();
+}
+function recalcPriceB() {
+  const val = document.getElementById('masterB1')?.value || 'ent';
+  const cfg = B1_CONFIGS[val] || B1_CONFIGS.ent;
+  const seats = parseInt(document.getElementById('b1i1')?.value) || 0;
+  const term  = parseInt(document.getElementById('b1i2')?.value) || 0;
+  const mods  = parseInt(document.getElementById('b1i5')?.value) || 0;
+  const disc  = Math.min(parseFloat(document.getElementById('b1i6')?.value) || 0, 35) / 100;
+  const base  = cfg.rate * seats * term;
+  const modCost = mods * cfg.mod;
+  const total = (base + modCost) * (1 - disc);
+  const fmt = v => '$' + Math.round(v).toLocaleString();
+  const el = document.getElementById('priceMainB1');
+  if (!el) return;
+  el.classList.add('updating');
+  setTimeout(() => el.classList.remove('updating'), 400);
+  el.innerHTML = `<span>$</span>${Math.round(total).toLocaleString()}`;
+  document.getElementById('b1Rate').textContent = `$${cfg.rate}/seat/mo`;
+  document.getElementById('b1Units').textContent = `${seats} × ${term}`;
+  document.getElementById('b1Mods').textContent = `+${fmt(modCost)}`;
+  document.getElementById('b1Disc').textContent = `−${(disc*100).toFixed(0)}%`;
+  document.getElementById('b1Total').textContent = fmt(total);
+}
+
+// ── PRICE CALC B2 ─────────────────────────────────
+function recalcPriceB2() {
+  const sw = 184000, hw = 95000, sup = 24000, svc = 18750;
+  const total = sw + hw + sup + svc;
+  const fmt = v => '$' + v.toLocaleString();
+  const el = document.getElementById('priceMainB2');
+  if (!el) return;
+  el.classList.add('updating');
+  setTimeout(() => el.classList.remove('updating'), 400);
+  el.innerHTML = `<span>$</span>${total.toLocaleString()}`;
+  document.getElementById('b2sw').textContent = fmt(sw);
+  document.getElementById('b2hw').textContent = fmt(hw);
+  document.getElementById('b2sup').textContent = fmt(sup);
+  document.getElementById('b2svc').textContent = fmt(svc);
+  document.getElementById('b2Total').textContent = fmt(total);
+}
+
+// ── TABS ──────────────────────────────────────────
+function switchTab(btnEl, tabId) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  btnEl.classList.add('active');
+  const tab = document.getElementById(tabId);
+  if (tab) tab.classList.add('active');
+}
+
+// ── INIT ──────────────────────────────────────────
+renderRail();
+</script>
+</body>
+</html>
