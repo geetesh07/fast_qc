@@ -1,5 +1,5 @@
 ;;; =====================================================================
-;;; METRIC_QC.LSP  v2.9   (clean rewrite)
+;;; METRIC_QC.LSP  v2.10   (clean rewrite)
 ;;;
 ;;; v2.1: value-rescue pass.  An inch entity stranded by position-greedy
 ;;;       matching inside a cluster of near-identical callouts is no longer
@@ -96,6 +96,12 @@
 (setq *qc-texts*   nil)
 (setq *qc-blocks*  nil)
 (setq *qc-doc-lfac* 1.0)   ; document DIMLFAC of the drawing currently being read
+;;; collection diagnostics (reset per drawing) -- tells us WHERE dims are found
+(setq *qc-space-kind* 'MS) ; 'MS while reading modelspace, 'LAY while reading layouts
+(setq *qc-dbg-msdim*  0)   ; dims found directly in modelspace
+(setq *qc-dbg-blkdim* 0)   ; dims found nested inside block references
+(setq *qc-dbg-laydim* 0)   ; dims found in paper-space layouts
+(setq *qc-dbg-skipdim* 0)  ; linear dims seen but DROPPED (no value or no position)
 
 ;;; -------------------------------------------------------------------
 ;;; Tiny helpers
@@ -495,10 +501,16 @@
 ;;;   *qc-texts* element : (worldpos nums sourcetext)
 ;;; -------------------------------------------------------------------
 ;; Dim entry shape:  (worldpos value handle)
-(defun qc:add-dim (obj mtx / val lp)
+(defun qc:add-dim (obj mtx depth / val lp)
   (setq val (qc:dim-value obj) lp (qc:dim-localpos obj))
   (if (and (numberp val) (qc:xy-p lp))
-    (setq *qc-dims* (cons (list (qc:m-apply mtx lp) val (qc:obj-handle obj)) *qc-dims*)))
+    (progn
+      (setq *qc-dims* (cons (list (qc:m-apply mtx lp) val (qc:obj-handle obj)) *qc-dims*))
+      (cond ((> depth 0)               (setq *qc-dbg-blkdim* (1+ *qc-dbg-blkdim*)))
+            ((eq *qc-space-kind* 'LAY) (setq *qc-dbg-laydim* (1+ *qc-dbg-laydim*)))
+            (T                         (setq *qc-dbg-msdim*  (1+ *qc-dbg-msdim*)))))
+    ;; linear dim that we could NOT read (no measurement or no ext-line points)
+    (setq *qc-dbg-skipdim* (1+ *qc-dbg-skipdim*)))
 )
 ;; Text entry shape:  (worldpos nums sourcetext handle)
 (defun qc:add-text-string (txt lp mtx handle / nums)
@@ -559,14 +571,21 @@
                   (if (not (vl-catch-all-error-p def))
                     (qc:collect-space def cmtx (1+ depth)))))))))))
 )
-(defun qc:collect-space (space mtx depth / obj oname)
+(defun qc:collect-space (space mtx depth / obj oname lyr)
   (vlax-for obj space
-    (setq oname (vla-get-ObjectName obj))
-    (cond
-      ((qc:linear-dim-p oname)              (qc:add-dim obj mtx))
-      ((wcmatch oname "AcDbText,AcDbMText") (qc:add-text obj mtx))
-      ((= oname "AcDbMLeader")              (qc:add-mleader obj mtx))
-      ((= oname "AcDbBlockReference")       (qc:descend-blockref obj mtx depth))))
+    (setq lyr (vl-catch-all-apply 'vla-get-Layer (list obj)))
+    ;; Skip our own QC markers from a previous run (they live on MC_PASS /
+    ;; MC_ERRORS).  Without this, "EXTRA 220.726mm" labels get re-read as text.
+    (if (and (= (type lyr) 'STR)
+             (or (= (strcase lyr) "MC_PASS") (= (strcase lyr) "MC_ERRORS")))
+      nil
+      (progn
+        (setq oname (vla-get-ObjectName obj))
+        (cond
+          ((qc:linear-dim-p oname)              (qc:add-dim obj mtx depth))
+          ((wcmatch oname "AcDbText,AcDbMText") (qc:add-text obj mtx))
+          ((= oname "AcDbMLeader")              (qc:add-mleader obj mtx))
+          ((= oname "AcDbBlockReference")       (qc:descend-blockref obj mtx depth))))))
 )
 (defun qc:collect-layouts (doc / layouts layout lname blk)
   (setq layouts (vl-catch-all-apply 'vla-get-Layouts (list doc)))
@@ -576,6 +595,7 @@
       (if (and (not (vl-catch-all-error-p lname)) (= (type lname) 'STR)
                (not (= (strcase lname) "MODEL")))
         (progn
+          (setq *qc-space-kind* 'LAY)
           (setq blk (vl-catch-all-apply 'vla-get-Block (list layout)))
           (if (not (vl-catch-all-error-p blk))
             (qc:collect-space blk (qc:m-identity) 0))))))
@@ -583,7 +603,9 @@
 (defun qc:collect (doc)
   (setq *qc-dims* nil *qc-texts* nil
         *qc-blocks*   (vla-get-Blocks doc)
-        *qc-doc-lfac* (qc:doc-dimlfac doc))
+        *qc-doc-lfac* (qc:doc-dimlfac doc)
+        *qc-dbg-msdim* 0 *qc-dbg-blkdim* 0 *qc-dbg-laydim* 0 *qc-dbg-skipdim* 0
+        *qc-space-kind* 'MS)
   (qc:collect-space (vla-get-ModelSpace doc) (qc:m-identity) 0)
   (qc:collect-layouts doc)
   (list *qc-dims* *qc-texts*)
@@ -998,7 +1020,7 @@
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
 
-  (princ "\n[METRIC_QC v2.9] Reading metric (active) drawing...")
+  (princ "\n[METRIC_QC v2.10] Reading metric (active) drawing...")
   (setq mc-res      (qc:collect metricDoc)
         metricDims  (car  mc-res)
         metricTexts (cadr mc-res)
@@ -1154,7 +1176,7 @@
   (princ
     (strcat
       "\n--------------------------------------------\n"
-      "METRIC_QC v2.9  --  handle -> absolute-pos -> FORCE 1:1 pairing\n"
+      "METRIC_QC v2.10  --  handle -> absolute-pos -> FORCE 1:1 pairing\n"
       "  Inch dims=" (itoa (length inchDims)) "  Metric dims=" (itoa (length metricDims))
       "   |  Inch text=" (itoa (length inchTexts)) "  Metric text=" (itoa (length metricTexts)) "\n"
       "  Dimensions : " (itoa dimPass) " pass   " (itoa dimFail) " fail\n"
@@ -1179,6 +1201,7 @@
     (/ *error* oldError acadObj metricDoc metricDir inchFile inchOpen inchDoc inchIsDbx
        mc-res ic-res metricDims inchDims metricTexts inchTexts metricLfac inchLfac
        dimRes dMatched dMiss dExtra dResc txtRes tMatched tMiss tExtra tResc
+       mMs mBlk mLay mSkip iMs iBlk iLay iSkip
        pr ie me iv mv exp df)
   (vl-load-com)
   (setq oldError *error*)
@@ -1193,10 +1216,11 @@
   (setq acadObj   (vlax-get-acad-object)
         metricDoc (vla-get-ActiveDocument acadObj)
         metricDir (qc:dwg-folder))
-  (princ "\n=== MQC_DIAG v2.9 ===")
+  (princ "\n=== MQC_DIAG v2.10 ===")
   (princ "\nReading metric...")
   (setq mc-res (qc:collect metricDoc) metricDims (car mc-res) metricTexts (cadr mc-res)
-        metricLfac *qc-doc-lfac*)
+        metricLfac *qc-doc-lfac*
+        mMs *qc-dbg-msdim* mBlk *qc-dbg-blkdim* mLay *qc-dbg-laydim* mSkip *qc-dbg-skipdim*)
   (princ (strcat " " (itoa (length metricDims)) " dim(s), " (itoa (length metricTexts))
                  " text(s).  DIMLFAC=" (qc:fmt metricLfac)))
 
@@ -1210,13 +1234,16 @@
         *qc-active-inch-doc* inchDoc *qc-active-inch-dbx* inchIsDbx)
   (princ "\nReading inch...")
   (setq ic-res (qc:collect inchDoc) inchDims (car ic-res) inchTexts (cadr ic-res)
-        inchLfac *qc-doc-lfac*)
+        inchLfac *qc-doc-lfac*
+        iMs *qc-dbg-msdim* iBlk *qc-dbg-blkdim* iLay *qc-dbg-laydim* iSkip *qc-dbg-skipdim*)
   (princ (strcat " " (itoa (length inchDims)) " dim(s), " (itoa (length inchTexts))
                  " text(s).  DIMLFAC=" (qc:fmt inchLfac)))
   (qc:close-inch inchDoc inchIsDbx)
   (setq *qc-active-inch-doc* nil *qc-active-inch-dbx* nil)
-  (princ (strcat "\n>> metric DIMLFAC=" (qc:fmt metricLfac) "  inch DIMLFAC=" (qc:fmt inchLfac)
-                 "  (if metric=25.4 the converter used display-scaling, not geometry rescale)"))
+  (princ "\n>> WHERE DIMS WERE FOUND (modelspace / in-blocks / layouts / dropped):")
+  (princ (strcat "\n   METRIC: ms=" (itoa mMs) "  blk=" (itoa mBlk) "  lay=" (itoa mLay) "  dropped=" (itoa mSkip)))
+  (princ (strcat "\n   INCH  : ms=" (itoa iMs) "  blk=" (itoa iBlk) "  lay=" (itoa iLay) "  dropped=" (itoa iSkip)))
+  (princ (strcat "\n   Inch opened via: " (if inchIsDbx "ObjectDBX" "VISIBLE FALLBACK")))
 
   ;; ----- DIMENSIONS: handle -> absolute-pos -> force -----
   (setq dimRes   (qc:match-by-handle inchDims metricDims 2)
@@ -1303,7 +1330,7 @@
 )
 (defun c:mqc_test (/ pass fail ok nums res m)
   (setq pass 0 fail 0)
-  (princ "\nMETRIC_QC v2.9 self-test")
+  (princ "\nMETRIC_QC v2.10 self-test")
 
   (setq nums (qc:dim-numbers "%%C.03 [.76]"))
   (setq ok (and (= (length nums) 2) (equal (car nums) 0.03 1e-8)))
@@ -1508,7 +1535,7 @@
   (princ)
 )
 
-(princ "\nMETRIC_QC.LSP v2.9 loaded.")
+(princ "\nMETRIC_QC.LSP v2.10 loaded.")
 (princ "\n  METRIC_CHECK (or MQC) -- run QC, place balloons on metric dwg")
 (princ "\n  MQC_DIAG              -- text dump: matched / missing / extra dims")
 (princ "\n  MQC_CLEAR             -- erase QC balloons + layers")
